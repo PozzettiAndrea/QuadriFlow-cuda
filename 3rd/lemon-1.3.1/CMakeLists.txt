@@ -178,6 +178,10 @@ IF(MSVC)
     "${CMAKE_SHARED_LINKER_FLAGS_DEBUG}" CACHE STRING
     "Flags used by the shared libraries linker during maintainer builds."
     )
+  SET( CMAKE_MODULE_LINKER_FLAGS_MAINTAINER
+    "${CMAKE_MODULE_LINKER_FLAGS_DEBUG}" CACHE STRING
+    "Flags used by the module linker during maintainer builds."
+    )
 ELSE()
   SET( CMAKE_CXX_FLAGS_MAINTAINER "-Werror -ggdb -O0" CACHE STRING
     "Flags used by the C++ compiler during maintainer builds."
@@ -193,13 +197,18 @@ ELSE()
     "${CMAKE_SHARED_LINKER_FLAGS_DEBUG}" CACHE STRING
     "Flags used by the shared libraries linker during maintainer builds."
     )
+  SET( CMAKE_MODULE_LINKER_FLAGS_MAINTAINER
+    "${CMAKE_MODULE_LINKER_FLAGS_DEBUG}" CACHE STRING
+    "Flags used by the module linker during maintainer builds."
+    )
 ENDIF()
 
 MARK_AS_ADVANCED(
     CMAKE_CXX_FLAGS_MAINTAINER
     CMAKE_C_FLAGS_MAINTAINER
     CMAKE_EXE_LINKER_FLAGS_MAINTAINER
-    CMAKE_SHARED_LINKER_FLAGS_MAINTAINER )
+    CMAKE_SHARED_LINKER_FLAGS_MAINTAINER
+    CMAKE_MODULE_LINKER_FLAGS_MAINTAINER )
 
 IF(CMAKE_CONFIGURATION_TYPES)
   LIST(APPEND CMAKE_CONFIGURATION_TYPES Maintainer)
