@@ -1,6 +1,7 @@
 #include "subdivide.hpp"
 
 #include <fstream>
+#include <map>
 #include <queue>
 
 #include "dedge.hpp"
@@ -10,8 +11,73 @@
 
 namespace qflow {
 
+#ifdef WITH_CUDA
+extern "C" void cuda_subdivide_mesh(
+    const double* V_in, int nV_in,
+    const int* F_in, int nF_in,
+    const double* rho_in,
+    const int* E2E_in,
+    const int* boundary_in,
+    const int* nonmanifold_in,
+    double maxLength,
+    double** V_out, int* nV_out,
+    int** F_out, int* nF_out,
+    double** rho_out,
+    int** boundary_out,
+    int** nonmanifold_out);
+#endif
+
 void subdivide(MatrixXi &F, MatrixXd &V, VectorXd& rho, VectorXi &V2E, VectorXi &E2E, VectorXi &boundary,
-               VectorXi &nonmanifold, double maxLength) {
+               VectorXi &nonmanifold, double maxLength, int strategy) {
+#ifdef WITH_CUDA
+    if (strategy == 1) {
+        // GPU parallel subdivision
+        double* V_out; int nV_out;
+        int* F_out; int nF_out;
+        double* rho_out;
+        int* boundary_out;
+        int* nonmanifold_out;
+
+        cuda_subdivide_mesh(
+            V.data(), V.cols(),
+            F.data(), F.cols(),
+            rho.data(),
+            E2E.data(),
+            boundary.data(),
+            nonmanifold.data(),
+            maxLength,
+            &V_out, &nV_out,
+            &F_out, &nF_out,
+            &rho_out,
+            &boundary_out,
+            &nonmanifold_out);
+
+        // Copy results back to Eigen matrices
+        V.resize(3, nV_out);
+        memcpy(V.data(), V_out, 3 * nV_out * sizeof(double));
+
+        F.resize(3, nF_out);
+        memcpy(F.data(), F_out, 3 * nF_out * sizeof(int));
+
+        rho.resize(nV_out);
+        memcpy(rho.data(), rho_out, nV_out * sizeof(double));
+
+        boundary.resize(nV_out);
+        for (int i = 0; i < nV_out; ++i) boundary[i] = boundary_out[i];
+
+        nonmanifold.resize(nV_out);
+        for (int i = 0; i < nV_out; ++i) nonmanifold[i] = nonmanifold_out[i];
+
+        // V2E and E2E will be rebuilt by compute_direct_graph after this returns
+        V2E.resize(nV_out);
+        E2E.resize(3 * nF_out);
+
+        free(V_out); free(F_out); free(rho_out);
+        free(boundary_out); free(nonmanifold_out);
+        return;
+    }
+#endif
+    // strategy == 0: original CPU implementation
     typedef std::pair<double, int> Edge;
 
     std::priority_queue<Edge> queue;
@@ -496,21 +562,35 @@ void subdivide_edgeDiff(MatrixXi &F, MatrixXd &V, MatrixXd &N, MatrixXd &Q, Matr
     boundary.conservativeResize(nV);
     nonmanifold.conservativeResize(nV);
     E2E.conservativeResize(nF * 3);
-    for (int i = 0; i < F.cols(); ++i) {
-        for (int j = 0; j < 3; ++j) {
-            auto diff = edge_diff[face_edgeIds[i][j]];
-            if (abs(diff[0]) > 1 || abs(diff[1]) > 1) {
-                printf("wrong init %d %d!\n", face_edgeIds[i][j], i * 3 + j);
-                //exit(0);
-                throw std::runtime_error("Failed: qflow::Hierarchy::subdivide_edgeDiff. wrong init.");
+    // Debug: count and report all bad edge_diffs before crashing
+    {
+        int bad_count = 0;
+        int max_abs_0 = 0, max_abs_1 = 0;
+        for (int i = 0; i < (int)edge_diff.size(); ++i) {
+            int a0 = abs(edge_diff[i][0]), a1 = abs(edge_diff[i][1]);
+            if (a0 > max_abs_0) max_abs_0 = a0;
+            if (a1 > max_abs_1) max_abs_1 = a1;
+            if (a0 > 1 || a1 > 1) {
+                bad_count++;
+                if (bad_count <= 20)
+                    printf("[DEBUG subdivide] bad edge_diff[%d] = (%d, %d)\n",
+                           i, edge_diff[i][0], edge_diff[i][1]);
             }
         }
-    }
-    for (int i = 0; i < edge_diff.size(); ++i) {
-        if (abs(edge_diff[i][0]) > 1 || abs(edge_diff[i][1]) > 1) {
-            printf("wrong...\n");
-            //exit(0);
-            throw std::runtime_error("Failed: qflow::Hierarchy::subdivide_edgeDiff. wrong.");
+        printf("[DEBUG subdivide] total edges: %d, bad edges: %d, max|d0|=%d max|d1|=%d\n",
+               (int)edge_diff.size(), bad_count, max_abs_0, max_abs_1);
+        if (bad_count > 0) {
+            // Print histogram of edge_diff magnitudes
+            std::map<std::pair<int,int>, int> hist;
+            for (int i = 0; i < (int)edge_diff.size(); ++i) {
+                auto key = std::make_pair(abs(edge_diff[i][0]), abs(edge_diff[i][1]));
+                hist[key]++;
+            }
+            printf("[DEBUG subdivide] edge_diff magnitude histogram:\n");
+            for (auto& kv : hist) {
+                printf("  |d|=(%d,%d): %d edges\n", kv.first.first, kv.first.second, kv.second);
+            }
+            throw std::runtime_error("Failed: qflow::Hierarchy::subdivide_edgeDiff. wrong init.");
         }
     }
 }
