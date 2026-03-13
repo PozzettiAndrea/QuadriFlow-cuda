@@ -17,6 +17,7 @@
 #include "field-math.hpp"
 #include "hierarchy.hpp"
 #include "post-solver.hpp"
+#include "checkpoint.hpp"
 #include "serialize.hpp"
 
 namespace qflow {
@@ -61,6 +62,8 @@ class Parametrizer {
     void BuildIntegerConstraints();
 
     // Fix Flip
+    void SaveFFState(const char* path);   // dump state needed by FixFlipHierarchy
+    void LoadFFState(const char* path);   // reload it
     void FixFlipHierarchy();
     void FixFlipSat();
     void FixHoles();

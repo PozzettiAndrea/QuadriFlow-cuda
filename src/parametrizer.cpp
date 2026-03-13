@@ -28,7 +28,12 @@ void Parametrizer::ComputeIndexMap(int with_scale) {
     auto& S = hierarchy.mS[0];
     // ComputeOrientationSingularities();
 
+    unsigned long long t_stage, t_start = GetCurrentTime64();
+    t_stage = t_start;
+
     BuildEdgeInfo();
+    printf("[TIMING] BuildEdgeInfo: %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+    t_stage = GetCurrentTime64();
 
     if (flag_preserve_sharp) {
         //        ComputeSharpO();
@@ -70,12 +75,31 @@ void Parametrizer::ComputeIndexMap(int with_scale) {
             }
         }
     }
+    printf("[TIMING] Sharp edge setup: %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+    t_stage = GetCurrentTime64();
+
 #ifdef LOG_OUTPUT
     printf("Build Integer Constraints...\n");
 #endif
     BuildIntegerConstraints();
+    printf("[TIMING] BuildIntegerConstraints: %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+    t_stage = GetCurrentTime64();
 
+    // Debug: check edge_diff before max flow
+    {
+        int bad = 0, max0 = 0, max1 = 0;
+        for (int i = 0; i < (int)edge_diff.size(); ++i) {
+            int a0 = abs(edge_diff[i][0]), a1 = abs(edge_diff[i][1]);
+            if (a0 > max0) max0 = a0;
+            if (a1 > max1) max1 = a1;
+            if (a0 > 1 || a1 > 1) bad++;
+        }
+        printf("[DEBUG pre-flow] edges: %d, bad: %d, max|d0|=%d max|d1|=%d\n",
+               (int)edge_diff.size(), bad, max0, max1);
+    }
     ComputeMaxFlow();
+    printf("[TIMING] ComputeMaxFlow: %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+    t_stage = GetCurrentTime64();
     // potential bug
 #ifdef LOG_OUTPUT
     printf("subdivide...\n");
@@ -83,6 +107,8 @@ void Parametrizer::ComputeIndexMap(int with_scale) {
     subdivide_edgeDiff(F, V, N, Q, O, &hierarchy.mS[0], V2E, hierarchy.mE2E, boundary, nonManifold,
                        edge_diff, edge_values, face_edgeOrients, face_edgeIds, sharp_edges,
                        singularities, 1);
+    printf("[TIMING] subdivide_edgeDiff (1st): %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+    t_stage = GetCurrentTime64();
 
     allow_changes.clear();
     allow_changes.resize(edge_diff.size() * 2, 1);
@@ -98,11 +124,26 @@ void Parametrizer::ComputeIndexMap(int with_scale) {
     printf("Fix flip advance...\n");
     int t1 = GetCurrentTime64();
 #endif
+    // If -save-ff was requested, dump state before FixFlipHierarchy
+    {
+        const char* ff_save = getenv("QUADRIFLOW_SAVE_FF");
+        if (ff_save && ff_save[0]) {
+            SaveFFState(ff_save);
+        }
+    }
     FixFlipHierarchy();
+    printf("[TIMING] FixFlipHierarchy: %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+    t_stage = GetCurrentTime64();
+
     subdivide_edgeDiff(F, V, N, Q, O, &hierarchy.mS[0], V2E, hierarchy.mE2E, boundary, nonManifold,
                        edge_diff, edge_values, face_edgeOrients, face_edgeIds, sharp_edges,
                        singularities, 1);
+    printf("[TIMING] subdivide_edgeDiff (2nd): %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+    t_stage = GetCurrentTime64();
+
     FixFlipSat();
+    printf("[TIMING] FixFlipSat: %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+    t_stage = GetCurrentTime64();
 
 #ifdef LOG_OUTPUT
     int t2 = GetCurrentTime64();
@@ -119,13 +160,21 @@ void Parametrizer::ComputeIndexMap(int with_scale) {
 
     Optimizer::optimize_positions_sharp(hierarchy, edge_values, edge_diff, sharp_edges,
                                         sharp_vertices, sharp_constraints, with_scale);
+    printf("[TIMING] optimize_positions_sharp: %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+    t_stage = GetCurrentTime64();
 
     Optimizer::optimize_positions_fixed(hierarchy, edge_values, edge_diff, sharp_vertices,
                                         sharp_constraints, flag_adaptive_scale);
+    printf("[TIMING] optimize_positions_fixed: %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+    t_stage = GetCurrentTime64();
 
     AdvancedExtractQuad();
+    printf("[TIMING] AdvancedExtractQuad: %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+    t_stage = GetCurrentTime64();
 
     FixValence();
+    printf("[TIMING] FixValence: %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+    t_stage = GetCurrentTime64();
 
     std::vector<int> sharp_o(O_compact.size(), 0);
     std::map<int, std::pair<Vector3d, Vector3d>> compact_sharp_constraints;
@@ -233,15 +282,16 @@ void Parametrizer::ComputeIndexMap(int with_scale) {
         }
     }
 
+    printf("[TIMING] pre-dynamic setup: %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+    t_stage = GetCurrentTime64();
+
     Optimizer::optimize_positions_dynamic(F, V, N, Q, Vset, O_compact, F_compact, V2E_compact,
                                           E2E_compact, sqrt(surface_area / F_compact.size()),
                                           diffs, diff_count, o2e, sharp_o,
                                           compact_sharp_constraints, flag_adaptive_scale);
+    printf("[TIMING] optimize_positions_dynamic: %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
 
-    //    optimize_quad_positions(O_compact, N_compact, Q_compact, F_compact, V2E_compact,
-    //    E2E_compact,
-    //                            V, N, Q, O, F, V2E, hierarchy.mE2E, disajoint_tree,
-    //                            hierarchy.mScale, false);
+    printf("[TIMING] === ComputeIndexMap TOTAL: %lf s ===\n", (GetCurrentTime64() - t_start) * 1e-3);
 }
 
 }  // namespace qflow
