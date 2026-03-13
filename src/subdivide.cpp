@@ -137,7 +137,7 @@ void subdivide(MatrixXi &F, MatrixXd &V, VectorXd& rho, VectorXi &V2E, VectorXi 
 
         /* Update V */
         V.col(vn) = (V.col(v0) + V.col(v1)) * 0.5f;
-        rho[vn] = 0.5f * (rho[v0], rho[v1]);
+        rho[vn] = 0.5f * (rho[v0] + rho[v1]);
         nonmanifold[vn] = false;
         boundary[vn] = is_boundary;
 
