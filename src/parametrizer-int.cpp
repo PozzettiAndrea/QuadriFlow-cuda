@@ -417,9 +417,32 @@ void Parametrizer::BuildIntegerConstraints() {
 }
 
 void Parametrizer::ComputeMaxFlow() {
+    unsigned long long t0 = GetCurrentTime64();
     hierarchy.DownsampleEdgeGraph(face_edgeOrients, face_edgeIds, edge_diff, allow_changes, 1);
+    printf("[TIMING]   DownsampleEdgeGraph: %lf s\n", (GetCurrentTime64() - t0) * 1e-3);
+    t0 = GetCurrentTime64();
     Optimizer::optimize_integer_constraints(hierarchy, singularities, flag_minimum_cost_flow);
+    printf("[TIMING]   optimize_integer_constraints: %lf s\n", (GetCurrentTime64() - t0) * 1e-3);
+    t0 = GetCurrentTime64();
     hierarchy.UpdateGraphValue(face_edgeOrients, face_edgeIds, edge_diff);
+    printf("[TIMING]   UpdateGraphValue: %lf s\n", (GetCurrentTime64() - t0) * 1e-3);
+    // Debug: check edge_diff after flow solve
+    {
+        int bad = 0, max0 = 0, max1 = 0;
+        for (int i = 0; i < (int)edge_diff.size(); ++i) {
+            int a0 = abs(edge_diff[i][0]), a1 = abs(edge_diff[i][1]);
+            if (a0 > max0) max0 = a0;
+            if (a1 > max1) max1 = a1;
+            if (a0 > 1 || a1 > 1) {
+                bad++;
+                if (bad <= 10)
+                    printf("[DEBUG post-flow] bad edge_diff[%d] = (%d, %d)\n",
+                           i, edge_diff[i][0], edge_diff[i][1]);
+            }
+        }
+        printf("[DEBUG post-flow] total edges: %d, bad: %d, max|d0|=%d max|d1|=%d\n",
+               (int)edge_diff.size(), bad, max0, max1);
+    }
 }
 
 } // namespace qflow

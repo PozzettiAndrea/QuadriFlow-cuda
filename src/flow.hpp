@@ -8,6 +8,10 @@
 
 #include "config.hpp"
 
+#ifdef WITH_CUDA
+#include "cuda_maxflow.hpp"
+#endif
+
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/boykov_kolmogorov_max_flow.hpp>
 #include <boost/graph/edmonds_karp_max_flow.hpp>
@@ -30,6 +34,71 @@ class MaxFlowHelper {
     virtual void addEdge(int x, int y, int c, int rc, int v, int cost = 1) = 0;
     virtual int compute() = 0;
     virtual void applyTo(std::vector<Vector2i>& edge_diff) = 0;
+};
+
+class PushRelabelMaxFlowHelper : public MaxFlowHelper {
+   public:
+    typedef int EdgeWeightType;
+    typedef adjacency_list_traits<vecS, vecS, directedS> Traits;
+    typedef adjacency_list < vecS, vecS, directedS,
+        property < vertex_name_t, std::string,
+        property < vertex_index_t, long,
+        property < vertex_color_t, boost::default_color_type,
+        property < vertex_distance_t, long,
+        property < vertex_predecessor_t, Traits::edge_descriptor > > > > >,
+        property < edge_capacity_t, EdgeWeightType,
+        property < edge_residual_capacity_t, EdgeWeightType,
+        property < edge_reverse_t, Traits::edge_descriptor > > > > Graph;
+
+   public:
+    PushRelabelMaxFlowHelper() { rev = get(edge_reverse, g); }
+    void resize(int n, int m) {
+        vertex_descriptors.resize(n);
+        for (int i = 0; i < n; ++i) vertex_descriptors[i] = add_vertex(g);
+    }
+    int compute() {
+        EdgeWeightType flow =
+            push_relabel_max_flow(g, vertex_descriptors.front(), vertex_descriptors.back());
+        return flow;
+    }
+    void addEdge(int x, int y, int c, int rc, int v, int cost = 1) {
+        Traits::edge_descriptor e1, e2;
+        e1 = add_edge(vertex_descriptors[x], vertex_descriptors[y], g).first;
+        e2 = add_edge(vertex_descriptors[y], vertex_descriptors[x], g).first;
+        put(edge_capacity, g, e1, c);
+        put(edge_capacity, g, e2, rc);
+        rev[e1] = e2;
+        rev[e2] = e1;
+        if (v != -1) {
+            edge_to_variables[e1] = std::make_pair(v, -1);
+            edge_to_variables[e2] = std::make_pair(v, 1);
+        }
+    }
+    void applyTo(std::vector<Vector2i>& edge_diff) {
+        property_map<Graph, edge_capacity_t>::type capacity = get(edge_capacity, g);
+        property_map<Graph, edge_residual_capacity_t>::type residual_capacity =
+            get(edge_residual_capacity, g);
+        graph_traits<Graph>::vertex_iterator u_iter, u_end;
+        graph_traits<Graph>::out_edge_iterator ei, e_end;
+        for (tie(u_iter, u_end) = vertices(g); u_iter != u_end; ++u_iter)
+            for (tie(ei, e_end) = out_edges(*u_iter, g); ei != e_end; ++ei)
+                if (capacity[*ei] > 0) {
+                    int flow = (capacity[*ei] - residual_capacity[*ei]);
+                    if (flow > 0) {
+                        auto it = edge_to_variables.find(*ei);
+                        if (it != edge_to_variables.end()) {
+                            edge_diff[it->second.first / 2][it->second.first % 2] +=
+                                it->second.second * flow;
+                        }
+                    }
+                }
+    }
+
+   private:
+    Graph g;
+    property_map<Graph, edge_reverse_t>::type rev;
+    std::vector<Traits::vertex_descriptor> vertex_descriptors;
+    std::map<Traits::edge_descriptor, std::pair<int, int>> edge_to_variables;
 };
 
 class BoykovMaxFlowHelper : public MaxFlowHelper {
@@ -106,6 +175,66 @@ class BoykovMaxFlowHelper : public MaxFlowHelper {
     property_map<Graph, edge_reverse_t>::type rev;
     std::vector<Traits::vertex_descriptor> vertex_descriptors;
     std::map<Traits::edge_descriptor, std::pair<int, int>> edge_to_variables;
+};
+
+class LemonPreflowHelper : public MaxFlowHelper {
+   public:
+    using Capacity = int;
+    using Graph = lemon::SmartDigraph;
+    using Node = Graph::Node;
+    using Arc = Graph::Arc;
+    template <typename ValueType>
+    using ArcMap = lemon::SmartDigraph::ArcMap<ValueType>;
+    using Preflow = lemon::Preflow<lemon::SmartDigraph, ArcMap<Capacity>>;
+
+   public:
+    LemonPreflowHelper() : capacity(graph), flow(graph), variable(graph) {}
+    ~LemonPreflowHelper(){};
+    void resize(int n, int m) {
+        nodes.reserve(n);
+        for (int i = 0; i < n; ++i) nodes.push_back(graph.addNode());
+    }
+    void addEdge(int x, int y, int c, int rc, int v, int cost = 1) {
+        assert(x >= 0);
+        assert(v >= -1);
+        if (c) {
+            auto e1 = graph.addArc(nodes[x], nodes[y]);
+            capacity[e1] = c;
+            variable[e1] = std::make_pair(v, -1);
+        }
+        if (rc) {
+            auto e2 = graph.addArc(nodes[y], nodes[x]);
+            capacity[e2] = rc;
+            variable[e2] = std::make_pair(v, 1);
+        }
+    }
+    int compute() {
+        Preflow pf(graph, capacity, nodes.front(), nodes.back());
+        pf.runMinCut();
+        // Copy flow values out
+        for (Graph::ArcIt e(graph); e != lemon::INVALID; ++e) {
+            flow[e] = pf.flow(e);
+        }
+        return pf.flowValue();
+    }
+    void applyTo(std::vector<Vector2i>& edge_diff) {
+        for (Graph::ArcIt e(graph); e != lemon::INVALID; ++e) {
+            int var = variable[e].first;
+            if (var == -1) continue;
+            int sgn = variable[e].second;
+            int f = flow[e];
+            if (f > 0) {
+                edge_diff[var / 2][var % 2] += sgn * f;
+            }
+        }
+    }
+
+   private:
+    Graph graph;
+    ArcMap<Capacity> capacity;
+    ArcMap<Capacity> flow;
+    ArcMap<std::pair<int, int>> variable;
+    std::vector<Node> nodes;
 };
 
 class NetworkSimplexFlowHelper : public MaxFlowHelper {
@@ -271,14 +400,14 @@ class ECMaxFlowHelper : public MaxFlowHelper {
         int id;
         int capacity, flow;
         int v, d;
-        FlowInfo* rev;
+        int rev_node, rev_idx;  // reverse edge: graph[rev_node][rev_idx]
     };
     struct SearchInfo {
-        SearchInfo(int _id, int _prev_id, FlowInfo* _info)
-            : id(_id), prev_id(_prev_id), info(_info) {}
+        SearchInfo(int _id, int _prev_id, int _edge_node, int _edge_idx)
+            : id(_id), prev_id(_prev_id), edge_node(_edge_node), edge_idx(_edge_idx) {}
         int id;
         int prev_id;
-        FlowInfo* info;
+        int edge_node, edge_idx;  // which edge got us here
     };
     ECMaxFlowHelper() { num = 0; }
     int num;
@@ -289,40 +418,26 @@ class ECMaxFlowHelper : public MaxFlowHelper {
         num = n;
     }
     void addEdge(int x, int y, int c, int rc, int v, int cost = 0) {
-        FlowInfo flow;
-        flow.id = y;
-        flow.capacity = c;
-        flow.flow = 0;
-        flow.v = v;
-        flow.d = -1;
-        graph[x].push_back(flow);
-        auto& f1 = graph[x].back();
-        flow.id = x;
-        flow.capacity = rc;
-        flow.flow = 0;
-        flow.v = v;
-        flow.d = 1;
-        graph[y].push_back(flow);
-        auto& f2 = graph[y].back();
-        f2.rev = &f1;
-        f1.rev = &f2;
+        int xi = (int)graph[x].size();
+        int yi = (int)graph[y].size();
+        graph[x].push_back({y, c, 0, v, -1, y, yi});
+        graph[y].push_back({x, rc, 0, v, 1, x, xi});
     }
     int compute() {
         int total_flow = 0;
-        int count = 0;
         while (true) {
-            count += 1;
             std::vector<int> vhash(num, 0);
             std::vector<SearchInfo> q;
-            q.push_back(SearchInfo(0, -1, 0));
+            q.push_back(SearchInfo(0, -1, -1, -1));
             vhash[0] = 1;
             int q_front = 0;
             bool found = false;
-            while (q_front < q.size()) {
+            while (q_front < (int)q.size()) {
                 int vert = q[q_front].id;
-                for (auto& l : graph[vert]) {
+                for (int ei = 0; ei < (int)graph[vert].size(); ++ei) {
+                    auto& l = graph[vert][ei];
                     if (vhash[l.id] || l.capacity <= l.flow) continue;
-                    q.push_back(SearchInfo(l.id, q_front, &l));
+                    q.push_back(SearchInfo(l.id, q_front, vert, ei));
                     vhash[l.id] = 1;
                     if (l.id == num - 1) {
                         found = true;
@@ -332,29 +447,23 @@ class ECMaxFlowHelper : public MaxFlowHelper {
                 if (found) break;
                 q_front += 1;
             }
-            if (q_front == q.size()) break;
-            int loc = q.size() - 1;
+            if (q_front == (int)q.size()) break;
+            int loc = (int)q.size() - 1;
             while (q[loc].prev_id != -1) {
-                q[loc].info->flow += 1;
-                q[loc].info->rev->flow -= 1;
+                auto& fwd = graph[q[loc].edge_node][q[loc].edge_idx];
+                fwd.flow += 1;
+                graph[fwd.rev_node][fwd.rev_idx].flow -= 1;
                 loc = q[loc].prev_id;
-                // int prev_v = q[loc].id;
-                // applyFlow(prev_v, current_v, 1);
-                // applyFlow(current_v, prev_v, -1);
             }
             total_flow += 1;
         }
         return total_flow;
     }
     void applyTo(std::vector<Vector2i>& edge_diff) {
-        for (int i = 0; i < graph.size(); ++i) {
+        for (int i = 0; i < (int)graph.size(); ++i) {
             for (auto& flow : graph[i]) {
                 if (flow.flow > 0 && flow.v != -1) {
-                    if (flow.flow > 0) {
-                        edge_diff[flow.v / 2][flow.v % 2] += flow.d * flow.flow;
-                        if (abs(edge_diff[flow.v / 2][flow.v % 2]) > 2) {
-                        }
-                    }
+                    edge_diff[flow.v / 2][flow.v % 2] += flow.d * flow.flow;
                 }
             }
         }
@@ -367,8 +476,115 @@ class ECMaxFlowHelper : public MaxFlowHelper {
             }
         }
     }
-    std::vector<std::list<FlowInfo>> graph;
+    std::vector<std::vector<FlowInfo>> graph;
 };
+
+#ifdef WITH_CUDA
+class CudaMaxFlowHelper : public MaxFlowHelper {
+   public:
+    struct EdgeInfo {
+        int src, dst, cap, var, sign;
+    };
+
+    CudaMaxFlowHelper() : num_nodes_(0) {}
+    ~CudaMaxFlowHelper() {}
+
+    void resize(int n, int m) {
+        num_nodes_ = n;
+        edges_.clear();
+        edges_.reserve(m * 2);  // forward + reverse
+    }
+
+    void addEdge(int x, int y, int c, int rc, int v, int cost = 1) {
+        // Forward edge: x -> y with capacity c
+        if (c > 0)
+            edges_.push_back({x, y, c, v, -1});
+        // Reverse edge: y -> x with capacity rc
+        if (rc > 0)
+            edges_.push_back({y, x, rc, v, 1});
+    }
+
+    int compute() {
+        // Build CSR from edge list
+        int num_edges = (int)edges_.size();
+
+        // Count degree per node
+        std::vector<int> nindex(num_nodes_ + 1, 0);
+        for (auto& e : edges_) {
+            nindex[e.src + 1]++;
+        }
+        for (int i = 1; i <= num_nodes_; i++) {
+            nindex[i] += nindex[i - 1];
+        }
+
+        // Fill CSR
+        std::vector<int> nlist(num_edges);
+        std::vector<int> cap(num_edges);
+        edge_csr_index_.resize(edges_.size());  // maps original edge idx to CSR position
+        std::vector<int> offset(num_nodes_, 0);
+        for (int i = 0; i < (int)edges_.size(); i++) {
+            int src = edges_[i].src;
+            int pos = nindex[src] + offset[src];
+            nlist[pos] = edges_[i].dst;
+            cap[pos] = edges_[i].cap;
+            edge_csr_index_[i] = pos;
+            offset[src]++;
+        }
+
+        // Build reverse CSR
+        std::vector<int> rnindex(num_nodes_ + 1, 0);
+        for (int i = 0; i < num_edges; i++) {
+            rnindex[nlist[i] + 1]++;
+        }
+        for (int i = 1; i <= num_nodes_; i++) {
+            rnindex[i] += rnindex[i - 1];
+        }
+
+        std::vector<int> rnlist(num_edges);
+        std::vector<int> retoe(num_edges);
+        std::vector<int> roffset(num_nodes_, 0);
+        for (int v = 0; v < num_nodes_; v++) {
+            for (int e = nindex[v]; e < nindex[v + 1]; e++) {
+                int dst = nlist[e];
+                int rpos = rnindex[dst] + roffset[dst];
+                rnlist[rpos] = v;
+                retoe[rpos] = e;
+                roffset[dst]++;
+            }
+        }
+
+        int source = 0;           // node 0 = source (addEdge uses v1=0 for source edges)
+        int sink = num_nodes_ - 1;  // last node = sink
+
+        result_ = cuda_maxflow_solve(
+            num_nodes_, source, sink,
+            nindex.data(), nlist.data(), cap.data(), num_edges,
+            rnindex.data(), rnlist.data(), retoe.data()
+        );
+
+        return result_.max_flow;
+    }
+
+    void applyTo(std::vector<Vector2i>& edge_diff) {
+        for (int i = 0; i < (int)edges_.size(); i++) {
+            int v = edges_[i].var;
+            if (v == -1) continue;
+            int sgn = edges_[i].sign;
+            int csr_idx = edge_csr_index_[i];
+            int f = result_.edge_flows[csr_idx];
+            if (f > 0) {
+                edge_diff[v / 2][v % 2] += sgn * f;
+            }
+        }
+    }
+
+   private:
+    int num_nodes_;
+    std::vector<EdgeInfo> edges_;
+    std::vector<int> edge_csr_index_;  // maps edges_[i] to CSR edge index
+    CudaMaxFlowResult result_;
+};
+#endif  // WITH_CUDA
 
 } // namespace qflow
 
