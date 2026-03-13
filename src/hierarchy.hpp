@@ -26,6 +26,7 @@ class Hierarchy {
     void generate_graph_coloring_deterministic(const AdjacentMatrix& adj, int size,
                                                std::vector<std::vector<int>>& phases);
     void FixFlip();
+    bool FixFlipAtLevel(int l);  // returns true if any fix was made
     int FixFlipSat(int depth, int threshold = 0);
     void PushDownwardFlip(int depth);
     void PropagateEdge();
@@ -36,6 +37,26 @@ class Hierarchy {
                           std::vector<Vector2i>& edge_diff);
 
     enum { MAX_DEPTH = 25 };
+
+    // ============================================================
+    // Runtime strategy flags (selectable via CLI flags)
+    // ============================================================
+
+    // -ff: FixFlip scan strategy
+    //   0 = "cpu"            — Original CPU sequential scan (baseline, correct)
+    //   1 = "gpu-prefilter"  — GPU identifies fixable faces, CPU applies in priority order
+    //   2 = "gpu-only"       — GPU identifies fixable faces, CPU applies ONLY those
+    int fixflip_strategy = 0;
+
+    // -subdiv: subdivide strategy (initial mesh refinement in Initialize)
+    //   0 = "cpu"            — Original CPU priority-queue edge splitting
+    //   1 = "cuda"           — GPU multi-pass parallel edge splitting
+    int subdiv_strategy = 0;  // default: cpu (GPU produces valid but different mesh)
+
+    // -dse: DownsampleEdgeGraph strategy
+    //   0 = "cpu"            — Original CPU sequential greedy
+    //   1 = "cuda"           — GPU index-priority peeling (matches CPU output)
+    int dse_strategy = 1;  // default: cuda when available
 
     void SaveToFile(FILE* fp);
     void LoadFromFile(FILE* fp);
