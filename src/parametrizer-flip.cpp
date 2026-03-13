@@ -1,3 +1,4 @@
+#include "config.hpp"
 #include "dedge.hpp"
 #include "parametrizer.hpp"
 
@@ -8,8 +9,78 @@
 
 namespace qflow {
 
+// ============================================================
+// Save/Load FixFlipHierarchy state for fast benchmarking.
+// Usage:
+//   Full run:   ./quadriflow -i model.obj -o out.obj -f 100000 -save-ff /tmp/ff.bin
+//   Bench only: ./quadriflow -bench-ff /tmp/ff.bin -ff gpu-prefilter
+// ============================================================
+
+void Parametrizer::SaveFFState(const char* path) {
+    FILE* fp = fopen(path, "wb");
+    if (!fp) { printf("[FF] Cannot open %s for writing\n", path); return; }
+
+    auto writeVec2i = [&](const std::vector<Vector2i>& v) {
+        int n = (int)v.size();
+        fwrite(&n, sizeof(int), 1, fp);
+        for (auto& x : v) { int d[2] = {x[0], x[1]}; fwrite(d, sizeof(int), 2, fp); }
+    };
+    auto writeVec3i = [&](const std::vector<Vector3i>& v) {
+        int n = (int)v.size();
+        fwrite(&n, sizeof(int), 1, fp);
+        for (auto& x : v) { int d[3] = {x[0], x[1], x[2]}; fwrite(d, sizeof(int), 3, fp); }
+    };
+    auto writeVecInt = [&](const std::vector<int>& v) {
+        int n = (int)v.size();
+        fwrite(&n, sizeof(int), 1, fp);
+        fwrite(v.data(), sizeof(int), n, fp);
+    };
+
+    writeVec3i(face_edgeOrients);
+    writeVec3i(face_edgeIds);
+    writeVec2i(edge_diff);
+    writeVecInt(allow_changes);
+    fclose(fp);
+    printf("[FF] State saved to %s (%zu faces, %zu edges)\n",
+           path, face_edgeIds.size(), edge_diff.size());
+}
+
+void Parametrizer::LoadFFState(const char* path) {
+    FILE* fp = fopen(path, "rb");
+    if (!fp) { printf("[FF] Cannot open %s for reading\n", path); return; }
+
+    auto readVec2i = [&](std::vector<Vector2i>& v) {
+        int n; fread(&n, sizeof(int), 1, fp);
+        v.resize(n);
+        for (auto& x : v) { int d[2]; fread(d, sizeof(int), 2, fp); x = Vector2i(d[0], d[1]); }
+    };
+    auto readVec3i = [&](std::vector<Vector3i>& v) {
+        int n; fread(&n, sizeof(int), 1, fp);
+        v.resize(n);
+        for (auto& x : v) { int d[3]; fread(d, sizeof(int), 3, fp); x = Vector3i(d[0], d[1], d[2]); }
+    };
+    auto readVecInt = [&](std::vector<int>& v) {
+        int n; fread(&n, sizeof(int), 1, fp);
+        v.resize(n);
+        fread(v.data(), sizeof(int), n, fp);
+    };
+
+    readVec3i(face_edgeOrients);
+    readVec3i(face_edgeIds);
+    readVec2i(edge_diff);
+    readVecInt(allow_changes);
+    fclose(fp);
+    printf("[FF] State loaded from %s (%zu faces, %zu edges)\n",
+           path, face_edgeIds.size(), edge_diff.size());
+}
+
 double Parametrizer::QuadEnergy(std::vector<int>& loop_vertices, std::vector<Vector4i>& res_quads,
                                 int level) {
+    // Memoized version: cache results by vertex list to avoid exponential recomputation.
+    // Sub-loop [v1,...,v_seg1] is the same for all seg2 values — classic overlapping subproblems.
+    static thread_local std::map<std::vector<int>, std::pair<double, std::vector<Vector4i>>> cache;
+    if (level == 0) cache.clear();  // clear cache at top-level call
+
     if (loop_vertices.size() < 4) return 0;
     if (loop_vertices.size() == 4) {
         double energy = 0;
@@ -31,9 +102,17 @@ double Parametrizer::QuadEnergy(std::vector<int>& loop_vertices, std::vector<Vec
             Vector4i(loop_vertices[0], loop_vertices[3], loop_vertices[2], loop_vertices[1]));
         return energy;
     }
+
+    // Check cache
+    auto cache_it = cache.find(loop_vertices);
+    if (cache_it != cache.end()) {
+        res_quads = cache_it->second.second;
+        return cache_it->second.first;
+    }
+
     double max_energy = 1e30;
-    for (int seg1 = 2; seg1 < loop_vertices.size(); seg1 += 2) {
-        for (int seg2 = seg1 + 1; seg2 < loop_vertices.size(); seg2 += 2) {
+    for (int seg1 = 2; seg1 < (int)loop_vertices.size(); seg1 += 2) {
+        for (int seg2 = seg1 + 1; seg2 < (int)loop_vertices.size(); seg2 += 2) {
             std::vector<Vector4i> quads[4];
             std::vector<int> vertices = {loop_vertices[0], loop_vertices[1], loop_vertices[seg1],
                                          loop_vertices[seg2]};
@@ -50,7 +129,7 @@ double Parametrizer::QuadEnergy(std::vector<int>& loop_vertices, std::vector<Vec
                 vertices.push_back(loop_vertices[seg2]);
                 energy += QuadEnergy(vertices, quads[2], level + 2);
             }
-            if (seg2 + 1 != loop_vertices.size()) {
+            if (seg2 + 1 != (int)loop_vertices.size()) {
                 std::vector<int> vertices(loop_vertices.begin() + seg2, loop_vertices.end());
                 vertices.push_back(loop_vertices[0]);
                 energy += QuadEnergy(vertices, quads[3], level + 1);
@@ -66,6 +145,9 @@ double Parametrizer::QuadEnergy(std::vector<int>& loop_vertices, std::vector<Vec
             }
         }
     }
+
+    // Store in cache
+    cache[loop_vertices] = {max_energy, res_quads};
     return max_energy;
 }
 
@@ -167,9 +249,16 @@ void Parametrizer::FixHoles() {
 
 void Parametrizer::FixFlipHierarchy() {
     Hierarchy fh;
+    fh.fixflip_strategy = hierarchy.fixflip_strategy;
+    unsigned long long _t0 = GetCurrentTime64();
     fh.DownsampleEdgeGraph(face_edgeOrients, face_edgeIds, edge_diff, allow_changes, -1);
+    unsigned long long _t1 = GetCurrentTime64();
     fh.FixFlip();
+    unsigned long long _t2 = GetCurrentTime64();
     fh.UpdateGraphValue(face_edgeOrients, face_edgeIds, edge_diff);
+    unsigned long long _t3 = GetCurrentTime64();
+    printf("[TIMING]   FFH: DownsampleEdgeGraph=%.3f FixFlip=%.3f UpdateGraphValue=%.3f s\n",
+           (_t1-_t0)*1e-3, (_t2-_t1)*1e-3, (_t3-_t2)*1e-3);
 }
 
 void Parametrizer::FixFlipSat() {
@@ -196,6 +285,7 @@ void Parametrizer::FixFlipSat() {
 }
 
 void Parametrizer::AdvancedExtractQuad() {
+    unsigned long long t_aeq = GetCurrentTime64();
     Hierarchy fh;
     fh.DownsampleEdgeGraph(face_edgeOrients, face_edgeIds, edge_diff, allow_changes, -1);
     auto& V = hierarchy.mV[0];
@@ -208,6 +298,8 @@ void Parametrizer::AdvancedExtractQuad() {
         }
     }
     disajoint_tree.BuildCompactParent();
+    printf("[TIMING]   AEQ: DownsampleEdgeGraph+DisjointTree: %lf s\n", (GetCurrentTime64() - t_aeq) * 1e-3);
+    t_aeq = GetCurrentTime64();
     auto& F2E = fh.mF2E.back();
     auto& E2F = fh.mE2F.back();
     auto& EdgeDiff = fh.mEdgeDiff.back();
@@ -260,8 +352,11 @@ void Parametrizer::AdvancedExtractQuad() {
     for (int i = 0; i < O_compact.size(); ++i) {
         O_compact[i] /= counter[i];
     }
+    printf("[TIMING]   AEQ: compact vertex setup: %lf s\n", (GetCurrentTime64() - t_aeq) * 1e-3);
+    t_aeq = GetCurrentTime64();
 
     BuildTriangleManifold(disajoint_tree, edge, face, edge_values, F2E, E2F, EdgeDiff, FQ);
+    printf("[TIMING]   AEQ: BuildTriangleManifold: %lf s\n", (GetCurrentTime64() - t_aeq) * 1e-3);
 }
 
 void Parametrizer::BuildTriangleManifold(DisajointTree& disajoint_tree, std::vector<int>& edge,
@@ -269,6 +364,7 @@ void Parametrizer::BuildTriangleManifold(DisajointTree& disajoint_tree, std::vec
                                          std::vector<Vector3i>& F2E, std::vector<Vector2i>& E2F,
                                          std::vector<Vector2i>& EdgeDiff,
                                          std::vector<Vector3i>& FQ) {
+    unsigned long long t_btm = GetCurrentTime64();
     auto& F = hierarchy.mF;
     std::vector<int> E2E(F2E.size() * 3, -1);
     for (int i = 0; i < E2F.size(); ++i) {
@@ -320,6 +416,9 @@ void Parametrizer::BuildTriangleManifold(DisajointTree& disajoint_tree, std::vec
             num_v += 1;
         }
     }
+
+    printf("[TIMING]     BTM: initial vertex assignment: %lf s\n", (GetCurrentTime64() - t_btm) * 1e-3);
+    t_btm = GetCurrentTime64();
 
     int num_v0 = num_v;
     do {
@@ -408,6 +507,9 @@ void Parametrizer::BuildTriangleManifold(DisajointTree& disajoint_tree, std::vec
             }
         }
     } while (num_v != num_v0);
+    printf("[TIMING]     BTM: vertex splitting loop: %lf s\n", (GetCurrentTime64() - t_btm) * 1e-3);
+    t_btm = GetCurrentTime64();
+
     int offset = 0;
     std::vector<Vector3i> triangle_edges, triangle_orients;
     for (int i = 0; i < triangle_vertices.size(); ++i) {
@@ -435,6 +537,9 @@ void Parametrizer::BuildTriangleManifold(DisajointTree& disajoint_tree, std::vec
     VectorXi NV2E, NE2E, NB, NN;
     compute_direct_graph(NV, NF, NV2E, NE2E, NB, NN);
 
+    printf("[TIMING]     BTM: compute_direct_graph: %lf s\n", (GetCurrentTime64() - t_btm) * 1e-3);
+    t_btm = GetCurrentTime64();
+
     std::map<DEdge, std::pair<Vector3i, Vector3i>> quads;
     for (int i = 0; i < triangle_vertices.size(); ++i) {
         for (int j = 0; j < 3; ++j) {
@@ -458,12 +563,17 @@ void Parametrizer::BuildTriangleManifold(DisajointTree& disajoint_tree, std::vec
                                          p.second.second[2]));
         }
     }
+    printf("[TIMING]     BTM: quad pairing: %lf s\n", (GetCurrentTime64() - t_btm) * 1e-3);
+    t_btm = GetCurrentTime64();
+
     std::swap(Vs, Vset);
     std::swap(O_compact, O);
     std::swap(N_compact, N);
     std::swap(Q_compact, Q);
     compute_direct_graph_quad(O_compact, F_compact, V2E_compact, E2E_compact, boundary_compact,
                               nonManifold_compact);
+    printf("[TIMING]     BTM: compute_direct_graph_quad: %lf s\n", (GetCurrentTime64() - t_btm) * 1e-3);
+    t_btm = GetCurrentTime64();
 
     while (true) {
         std::vector<int> erasedF(F_compact.size(), 0);
@@ -513,9 +623,16 @@ void Parametrizer::BuildTriangleManifold(DisajointTree& disajoint_tree, std::vec
         compute_direct_graph_quad(O_compact, F_compact, V2E_compact, E2E_compact, boundary_compact,
                                   nonManifold_compact);
     }
+    printf("[TIMING]     BTM: cleanup loop: %lf s\n", (GetCurrentTime64() - t_btm) * 1e-3);
+    t_btm = GetCurrentTime64();
+
     FixHoles();
+    printf("[TIMING]     BTM: FixHoles: %lf s\n", (GetCurrentTime64() - t_btm) * 1e-3);
+    t_btm = GetCurrentTime64();
+
     compute_direct_graph_quad(O_compact, F_compact, V2E_compact, E2E_compact, boundary_compact,
                               nonManifold_compact);
+    printf("[TIMING]     BTM: final compute_direct_graph_quad: %lf s\n", (GetCurrentTime64() - t_btm) * 1e-3);
 
     /*
     for (auto& p : flip_vertices) {
