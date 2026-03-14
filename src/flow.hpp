@@ -2,8 +2,10 @@
 #define FLOW_H_
 
 #include <Eigen/Core>
+#include <functional>
 #include <list>
 #include <map>
+#include <queue>
 #include <vector>
 
 #include "config.hpp"
@@ -486,8 +488,10 @@ class CudaMaxFlowHelper : public MaxFlowHelper {
         int src, dst, cap, var, sign;
     };
 
-    CudaMaxFlowHelper() : num_nodes_(0) {}
+    CudaMaxFlowHelper() : num_nodes_(0), mode_(3) {}
     ~CudaMaxFlowHelper() {}
+
+    void set_mode(int m) { mode_ = m; }  // 1=GPU+refine, 3=Dinic
 
     void resize(int n, int m) {
         num_nodes_ = n;
@@ -505,22 +509,19 @@ class CudaMaxFlowHelper : public MaxFlowHelper {
     }
 
     int compute() {
-        // Build CSR from edge list
+        int mode = mode_;
+        unsigned long long t0 = GetCurrentTime64();
+
+        // Build CSR from edge list (shared by both modes)
         int num_edges = (int)edges_.size();
 
-        // Count degree per node
         std::vector<int> nindex(num_nodes_ + 1, 0);
-        for (auto& e : edges_) {
-            nindex[e.src + 1]++;
-        }
-        for (int i = 1; i <= num_nodes_; i++) {
-            nindex[i] += nindex[i - 1];
-        }
+        for (auto& e : edges_) nindex[e.src + 1]++;
+        for (int i = 1; i <= num_nodes_; i++) nindex[i] += nindex[i - 1];
 
-        // Fill CSR
         std::vector<int> nlist(num_edges);
         std::vector<int> cap(num_edges);
-        edge_csr_index_.resize(edges_.size());  // maps original edge idx to CSR position
+        edge_csr_index_.resize(edges_.size());
         std::vector<int> offset(num_nodes_, 0);
         for (int i = 0; i < (int)edges_.size(); i++) {
             int src = edges_[i].src;
@@ -531,14 +532,9 @@ class CudaMaxFlowHelper : public MaxFlowHelper {
             offset[src]++;
         }
 
-        // Build reverse CSR
         std::vector<int> rnindex(num_nodes_ + 1, 0);
-        for (int i = 0; i < num_edges; i++) {
-            rnindex[nlist[i] + 1]++;
-        }
-        for (int i = 1; i <= num_nodes_; i++) {
-            rnindex[i] += rnindex[i - 1];
-        }
+        for (int i = 0; i < num_edges; i++) rnindex[nlist[i] + 1]++;
+        for (int i = 1; i <= num_nodes_; i++) rnindex[i] += rnindex[i - 1];
 
         std::vector<int> rnlist(num_edges);
         std::vector<int> retoe(num_edges);
@@ -553,15 +549,44 @@ class CudaMaxFlowHelper : public MaxFlowHelper {
             }
         }
 
-        int source = 0;           // node 0 = source (addEdge uses v1=0 for source edges)
-        int sink = num_nodes_ - 1;  // last node = sink
+        int source = 0;
+        int sink = num_nodes_ - 1;
 
-        result_ = cuda_maxflow_solve(
+        unsigned long long t1 = GetCurrentTime64();
+        printf("[TIMING]       CSR build: %lf s\n", (t1 - t0) * 1e-3);
+
+        if (mode == 1) {
+            // ---- GPU push-relabel + local cycle cancellation ----
+            result_ = cuda_maxflow_solve(
+                num_nodes_, source, sink,
+                nindex.data(), nlist.data(), cap.data(), num_edges,
+                rnindex.data(), rnlist.data(), retoe.data()
+            );
+            refine_flow_local(
+                result_.edge_flows, nindex, nlist, cap,
+                rnindex, rnlist, retoe,
+                num_nodes_, source, sink,
+                /*max_radius=*/10, /*max_iters=*/3
+            );
+            return result_.max_flow;
+        }
+
+        if (mode == 3) {
+            // ---- GPU Edmonds-Karp ----
+            result_ = cuda_edmonds_karp_solve(
+                num_nodes_, source, sink,
+                nindex.data(), nlist.data(), cap.data(), num_edges,
+                rnindex.data(), rnlist.data(), retoe.data()
+            );
+            return result_.max_flow;
+        }
+
+        // ---- mode == 4: GPU Dinic's (fwd BFS + bwd BFS + multi-augment) ----
+        result_ = cuda_dinic_solve(
             num_nodes_, source, sink,
             nindex.data(), nlist.data(), cap.data(), num_edges,
             rnindex.data(), rnlist.data(), retoe.data()
         );
-
         return result_.max_flow;
     }
 
@@ -578,8 +603,153 @@ class CudaMaxFlowHelper : public MaxFlowHelper {
         }
     }
 
+    // ---- Local cycle cancellation refinement ----
+    // After GPU push-relabel finds max-flow, reroute flow away from
+    // overloaded edges (flow >= 2) via short alternative paths in the
+    // residual graph. This reduces bad edges (|edge_diff| > 1) without
+    // changing total flow. With uniform costs, this approximates min-cost flow.
+    void refine_flow_local(
+        std::vector<int>& flow,          // [num_edges] in CSR order, modified in place
+        const std::vector<int>& nindex,
+        const std::vector<int>& nlist,
+        const std::vector<int>& cap,
+        const std::vector<int>& rnindex,
+        const std::vector<int>& rnlist,
+        const std::vector<int>& retoe,
+        int num_nodes, int source, int sink,
+        int max_radius = 15, int max_iters = 10
+    ) {
+        int num_edges = (int)flow.size();
+
+        // Precompute edge_src[e] = source node of CSR edge e
+        std::vector<int> edge_src(num_edges);
+        for (int u = 0; u < num_nodes; u++) {
+            for (int e = nindex[u]; e < nindex[u + 1]; e++) {
+                edge_src[e] = u;
+            }
+        }
+
+        // BFS working arrays — allocate once, reuse
+        std::vector<int> dist(num_nodes);
+        std::vector<int> parent_node(num_nodes);  // which node we came from
+        std::vector<int> parent_edge(num_nodes);  // CSR edge used to reach this node
+        std::vector<int> parent_dir(num_nodes);   // +1=forward, -1=backward
+        std::vector<int> bfs_queue;
+        bfs_queue.reserve(1024);
+        std::vector<int> visited;  // track visited nodes for fast reset
+        visited.reserve(1024);
+
+        int total_rerouted = 0;
+        unsigned long long t0 = GetCurrentTime64();
+
+        for (int iter = 0; iter < max_iters; iter++) {
+            int rerouted_this_iter = 0;
+
+            // Collect overloaded edges (flow >= 2)
+            std::vector<int> bad_edges;
+            for (int e = 0; e < num_edges; e++) {
+                if (flow[e] >= 2) bad_edges.push_back(e);
+            }
+            if (bad_edges.empty()) break;
+
+            printf("[FLOW-REFINE]   iter %d: %d edges with flow>=2\n", iter, (int)bad_edges.size());
+
+            for (int bad_e : bad_edges) {
+                if (flow[bad_e] < 2) continue;  // may have been fixed by earlier reroute
+
+                int u = edge_src[bad_e];
+                int v_target = nlist[bad_e];
+                if (u == source || u == sink || v_target == source || v_target == sink) continue;
+
+                // BFS in residual graph from v_target to u, avoiding the bad edge.
+                // A path v_target -> ... -> u plus the backward arc u->v_target
+                // forms a negative cycle that reroutes 1 unit of flow.
+
+                // Reset BFS state (only visited nodes)
+                for (int n : visited) dist[n] = -1;
+                visited.clear();
+                bfs_queue.clear();
+
+                dist[v_target] = 0;
+                bfs_queue.push_back(v_target);
+                visited.push_back(v_target);
+
+                bool found = false;
+                for (int qi = 0; qi < (int)bfs_queue.size() && !found; qi++) {
+                    int cur = bfs_queue[qi];
+                    if (dist[cur] >= max_radius) break;
+
+                    // Forward edges from cur: only use edges with flow=0
+                    // (prevents creating new overloaded edges)
+                    for (int e = nindex[cur]; e < nindex[cur + 1]; e++) {
+                        if (e == bad_e) continue;
+                        int nbr = nlist[e];
+                        if (dist[nbr] != -1) continue;
+                        if (flow[e] != 0 || cap[e] <= 0) continue;
+                        dist[nbr] = dist[cur] + 1;
+                        parent_node[nbr] = cur;
+                        parent_edge[nbr] = e;
+                        parent_dir[nbr] = 1;
+                        bfs_queue.push_back(nbr);
+                        visited.push_back(nbr);
+                        if (nbr == u) { found = true; break; }
+                    }
+                    if (found) break;
+
+                    // Backward edges to cur: arcs (nbr->cur) with flow > 0
+                    for (int re = rnindex[cur]; re < rnindex[cur + 1]; re++) {
+                        int e_fwd = retoe[re];
+                        if (e_fwd == bad_e) continue;
+                        int nbr = rnlist[re];  // nbr is the source of arc e_fwd
+                        if (dist[nbr] != -1) continue;
+                        if (flow[e_fwd] <= 0) continue;
+                        dist[nbr] = dist[cur] + 1;
+                        parent_node[nbr] = cur;
+                        parent_edge[nbr] = e_fwd;
+                        parent_dir[nbr] = -1;
+                        bfs_queue.push_back(nbr);
+                        visited.push_back(nbr);
+                        if (nbr == u) { found = true; break; }
+                    }
+                }
+
+                if (!found) continue;
+
+                // Trace path from u back to v_target, push 1 unit along each arc
+                int cur = u;
+                while (cur != v_target) {
+                    int e = parent_edge[cur];
+                    int dir = parent_dir[cur];
+                    int prev = parent_node[cur];
+                    if (dir == 1) {
+                        flow[e] += 1;   // forward: add flow
+                    } else {
+                        flow[e] -= 1;   // backward: cancel flow
+                    }
+                    cur = prev;
+                }
+                // Cancel 1 unit on the bad edge
+                flow[bad_e] -= 1;
+                rerouted_this_iter++;
+            }
+
+            total_rerouted += rerouted_this_iter;
+            if (rerouted_this_iter == 0) break;
+        }
+
+        unsigned long long t1 = GetCurrentTime64();
+        // Count remaining overloaded edges
+        int remaining = 0;
+        for (int e = 0; e < num_edges; e++) {
+            if (flow[e] >= 2) remaining++;
+        }
+        printf("[FLOW-REFINE] %d edges rerouted, %d still overloaded (%.3f s)\n",
+               total_rerouted, remaining, (t1 - t0) * 1e-3);
+    }
+
    private:
     int num_nodes_;
+    int mode_;  // 1=GPU push-relabel+refine, 3=CPU Dinic's
     std::vector<EdgeInfo> edges_;
     std::vector<int> edge_csr_index_;  // maps edges_[i] to CSR edge index
     CudaMaxFlowResult result_;

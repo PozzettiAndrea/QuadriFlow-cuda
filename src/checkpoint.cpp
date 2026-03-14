@@ -240,6 +240,8 @@ void save_checkpoint(const Parametrizer& p_const, PipelineStage stage,
     strncpy(hdr.stage, stage_names[stage], sizeof(hdr.stage) - 1);
     hdr.fixflip_strategy = p.hierarchy.fixflip_strategy;
     hdr.dse_strategy = p.hierarchy.dse_strategy;
+    hdr.subdiv_strategy = p.hierarchy.subdiv_strategy;
+    hdr.flow_strategy = p.hierarchy.flow_strategy;
     hdr.flag_preserve_sharp = p.flag_preserve_sharp;
     hdr.flag_preserve_boundary = p.flag_preserve_boundary;
     hdr.flag_adaptive_scale = p.flag_adaptive_scale;
@@ -267,6 +269,7 @@ void save_checkpoint(const Parametrizer& p_const, PipelineStage stage,
     Save(fp, p.hierarchy.fixflip_strategy);
     Save(fp, p.hierarchy.dse_strategy);
     Save(fp, p.hierarchy.subdiv_strategy);
+    Save(fp, p.hierarchy.flow_strategy);
     Save(fp, p.hierarchy.rng_seed);
     Save(fp, p.hierarchy.with_scale);
     p.hierarchy.SaveToFile(fp);
@@ -340,8 +343,8 @@ void save_checkpoint(const Parametrizer& p_const, PipelineStage stage,
     if (stat(path.c_str(), &st) == 0) file_size = st.st_size;
     printf("[CHECKPOINT] Saved '%s' to %s (%.1f MB)\n",
            stage_names[stage], path.c_str(), file_size / (1024.0 * 1024.0));
-    printf("[CHECKPOINT]   strategies: ff=%d dse=%d | flags: sharp=%d boundary=%d adaptive=%d sat=%d mcf=%d\n",
-           hdr.fixflip_strategy, hdr.dse_strategy,
+    printf("[CHECKPOINT]   strategies: ff=%d subdiv=%d dse=%d flow=%d | flags: sharp=%d boundary=%d adaptive=%d sat=%d mcf=%d\n",
+           hdr.fixflip_strategy, hdr.subdiv_strategy, hdr.dse_strategy, hdr.flow_strategy,
            hdr.flag_preserve_sharp, hdr.flag_preserve_boundary,
            hdr.flag_adaptive_scale, hdr.flag_aggresive_sat, hdr.flag_minimum_cost_flow);
 }
@@ -377,8 +380,8 @@ PipelineStage load_checkpoint(Parametrizer& p, const char* dir, PipelineStage st
     PipelineStage saved_stage = (PipelineStage)stage_idx;
 
     printf("[CHECKPOINT] Loading '%s' from %s\n", stage_names[saved_stage], path.c_str());
-    printf("[CHECKPOINT]   saved with: ff=%d dse=%d | flags: sharp=%d boundary=%d adaptive=%d sat=%d mcf=%d\n",
-           hdr.fixflip_strategy, hdr.dse_strategy,
+    printf("[CHECKPOINT]   saved with: ff=%d subdiv=%d dse=%d flow=%d | flags: sharp=%d boundary=%d adaptive=%d sat=%d mcf=%d\n",
+           hdr.fixflip_strategy, hdr.subdiv_strategy, hdr.dse_strategy, hdr.flow_strategy,
            hdr.flag_preserve_sharp, hdr.flag_preserve_boundary,
            hdr.flag_adaptive_scale, hdr.flag_aggresive_sat, hdr.flag_minimum_cost_flow);
     printf("[CHECKPOINT]   input mesh: %s | target faces: %d\n", hdr.input_mesh, hdr.target_faces);
@@ -395,6 +398,7 @@ PipelineStage load_checkpoint(Parametrizer& p, const char* dir, PipelineStage st
     Read(fp, p.hierarchy.fixflip_strategy);
     Read(fp, p.hierarchy.dse_strategy);
     Read(fp, p.hierarchy.subdiv_strategy);
+    Read(fp, p.hierarchy.flow_strategy);
     Read(fp, p.hierarchy.rng_seed);
     Read(fp, p.hierarchy.with_scale);
     p.hierarchy.LoadFromFile(fp);

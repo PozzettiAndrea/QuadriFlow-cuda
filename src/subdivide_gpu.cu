@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <algorithm>
 
 // ---- Kernel: mark edges that are too long ----
 __global__ void k_mark_long_edges(
@@ -106,6 +107,62 @@ __global__ void k_resolve_cross_face(
     int other = E2E[idx];
     if (other != -1 && edge_marks[other] && idx > other) {
         edge_marks[idx] = 0;
+    }
+}
+
+// ---- Kernel: resolve neighbor conflicts (Luby-like independent set) ----
+// A split of edge (idx) rewrites both f0 (containing idx) and f1 (twin's face).
+// Two marks that share a face must not both survive.
+// Each marked edge checks both faces it touches. If any competing mark is
+// *longer* (or same length but higher index), this edge yields.
+// Longest-first priority produces near-optimal triangulations matching CPU.
+// Proof: if marks A and B both survive and share a face, then neither dominates
+// the other: len(A)==len(B) and idx(A)==idx(B), so A==B. Contradiction. QED.
+__global__ void k_resolve_neighbor_conflicts(
+    const double* V,
+    const int* F,
+    const int* E2E,
+    int nE,
+    int* edge_marks
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nE) return;
+    if (!edge_marks[idx]) return;
+
+    // Compute my edge length squared
+    int f0 = idx / 3, j0 = idx % 3;
+    int va = F[j0 + f0 * 3], vb = F[((j0 + 1) % 3) + f0 * 3];
+    double dx = V[va*3] - V[vb*3], dy = V[va*3+1] - V[vb*3+1], dz = V[va*3+2] - V[vb*3+2];
+    double my_len = dx*dx + dy*dy + dz*dz;
+
+    // Check if another marked edge beats us (longer wins, higher index breaks ties)
+    auto dominated_by = [&](int other_idx) -> bool {
+        if (other_idx < 0 || !edge_marks[other_idx]) return false;
+        int fo = other_idx / 3, jo = other_idx % 3;
+        int ua = F[jo + fo * 3], ub = F[((jo + 1) % 3) + fo * 3];
+        double ex = V[ua*3] - V[ub*3], ey = V[ua*3+1] - V[ub*3+1], ez = V[ua*3+2] - V[ub*3+2];
+        double other_len = ex*ex + ey*ey + ez*ez;
+        return (other_len > my_len) || (other_len == my_len && other_idx > idx);
+    };
+
+    // Check f0 (our face): do any of our face-mates' twins bring in a longer mark?
+    for (int j = 0; j < 3; j++) {
+        int he = f0 * 3 + j;
+        if (he == idx) continue;
+        int twin = E2E[he];
+        if (dominated_by(twin)) { edge_marks[idx] = 0; return; }
+    }
+
+    // Check f1 (twin's face)
+    int twin_of_idx = E2E[idx];
+    if (twin_of_idx == -1) return;  // boundary, no f1
+    int f1 = twin_of_idx / 3;
+    for (int j = 0; j < 3; j++) {
+        int he = f1 * 3 + j;
+        if (he == twin_of_idx) continue;  // skip twin (same edge as us)
+        if (dominated_by(he)) { edge_marks[idx] = 0; return; }
+        int twin2 = E2E[he];
+        if (dominated_by(twin2)) { edge_marks[idx] = 0; return; }
     }
 }
 
@@ -259,9 +316,23 @@ void cuda_subdivide_mesh(
     double maxLengthSq = maxLength * maxLength;
     int nV = nV_in, nF = nF_in;
 
-    // Capacity: 10x initial size
-    int capV = nV_in * 10;
-    int capF = nF_in * 10;
+    // Debug: rho and threshold stats
+    {
+        double rho_min = rho_in[0], rho_max = rho_in[0], rho_sum = 0;
+        for (int i = 0; i < nV_in; i++) {
+            if (rho_in[i] < rho_min) rho_min = rho_in[i];
+            if (rho_in[i] > rho_max) rho_max = rho_in[i];
+            rho_sum += rho_in[i];
+        }
+        printf("[SUBDIV-GPU] pre-split: nV=%d nF=%d maxLength=%.6f maxLengthSq=%.6f\n",
+               nV_in, nF_in, maxLength, maxLengthSq);
+        printf("[SUBDIV-GPU] rho stats: min=%.6f max=%.6f mean=%.6f\n",
+               rho_min, rho_max, rho_sum / nV_in);
+    }
+
+    // Capacity: 10x initial size, minimum 1000
+    int capV = std::max(nV_in * 10, 1000);
+    int capF = std::max(nF_in * 10, 2000);
     int capE = capF * 3;
 
     printf("[SUBDIV-GPU] Allocating GPU buffers: capV=%d capF=%d (%.0f MB)\n",
@@ -315,10 +386,11 @@ void cuda_subdivide_mesh(
         int grid_e = (nE + block - 1) / block;
         int grid_f = (nF + block - 1) / block;
 
-        // 1-3. Mark + resolve conflicts
+        // 1-4. Mark + resolve conflicts
         k_mark_long_edges<<<grid_e, block>>>(d_V, d_F, d_E2E, d_nm, nF, maxLengthSq, d_rho, d_marks);
         k_resolve_conflicts<<<grid_f, block>>>(d_V, d_F, nF, d_marks);
         k_resolve_cross_face<<<grid_e, block>>>(d_E2E, nF, d_marks);
+        k_resolve_neighbor_conflicts<<<grid_e, block>>>(d_V, d_F, d_E2E, nE, d_marks);
 
         // 4. Count splits
         thrust::device_ptr<int> marks_ptr(d_marks);
@@ -384,6 +456,24 @@ void cuda_subdivide_mesh(
         pass++;
         printf("[SUBDIV-GPU]   pass %d: %d splits (%d total), nV=%d nF=%d\n",
                pass, num_splits, total_splits, nV, nF);
+
+        // Debug: dump mesh state for tiny meshes
+        cudaDeviceSynchronize();
+        if (nV_in < 100) {
+            double* dbg_V = (double*)malloc(3 * nV * sizeof(double));
+            int* dbg_F = (int*)malloc(3 * nF * sizeof(int));
+            int* dbg_marks = (int*)malloc(3 * nF * sizeof(int));
+            cudaMemcpy(dbg_V, d_V, 3 * nV * sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(dbg_F, d_F, 3 * nF * sizeof(int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(dbg_marks, d_marks, 3 * nF * sizeof(int), cudaMemcpyDeviceToHost);
+            printf("[SUBDIV-GPU]   vertices after pass %d:\n", pass);
+            for (int i = 0; i < nV; i++)
+                printf("    v%d: (%.4f, %.4f, %.4f)\n", i, dbg_V[i*3], dbg_V[i*3+1], dbg_V[i*3+2]);
+            printf("[SUBDIV-GPU]   faces after pass %d:\n", pass);
+            for (int i = 0; i < nF; i++)
+                printf("    f%d: v%d v%d v%d\n", i, dbg_F[i*3], dbg_F[i*3+1], dbg_F[i*3+2]);
+            free(dbg_V); free(dbg_F); free(dbg_marks);
+        }
     }
 
     printf("[SUBDIV-GPU] Done: %d passes, %d total splits, final nV=%d nF=%d\n",

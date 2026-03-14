@@ -82,6 +82,20 @@ void subdivide(MatrixXi &F, MatrixXd &V, VectorXd& rho, VectorXi &V2E, VectorXi 
 
     std::priority_queue<Edge> queue;
 
+    // Debug: rho and threshold stats
+    {
+        double rho_min = rho[0], rho_max = rho[0], rho_sum = 0;
+        for (int i = 0; i < rho.size(); i++) {
+            rho_min = std::min(rho_min, rho[i]);
+            rho_max = std::max(rho_max, rho[i]);
+            rho_sum += rho[i];
+        }
+        printf("[SUBDIV-CPU] pre-split: nV=%d nF=%d maxLength=%.6f maxLengthSq=%.6f\n",
+               (int)V.cols(), (int)F.cols(), maxLength, maxLength*maxLength);
+        printf("[SUBDIV-CPU] rho stats: min=%.6f max=%.6f mean=%.6f\n",
+               rho_min, rho_max, rho_sum / rho.size());
+    }
+
     maxLength *= maxLength;
 
     for (int i = 0; i < E2E.size(); ++i) {
@@ -126,6 +140,12 @@ void subdivide(MatrixXi &F, MatrixXd &V, VectorXd& rho, VectorXi &V2E, VectorXi 
         int v1p = is_boundary ? -1 : F((e1 + 2) % 3, f1);
         int vn = nV++;
         nSplit++;
+        if (V.cols() < 200) {
+            double len = (V.col(v0) - V.col(v1)).norm();
+            printf("[SUBDIV-CPU] split #%d: edge v%d-v%d (len=%.6f) -> v%d at (%.4f,%.4f,%.4f)\n",
+                   nSplit, v0, v1, len, vn,
+                   (V(0,v0)+V(0,v1))*0.5, (V(1,v0)+V(1,v1))*0.5, (V(2,v0)+V(2,v1))*0.5);
+        }
         /* Update V */
         if (nV > V.cols()) {
             V.conservativeResize(V.rows(), V.cols() * 2);
@@ -137,7 +157,7 @@ void subdivide(MatrixXi &F, MatrixXd &V, VectorXd& rho, VectorXi &V2E, VectorXi 
 
         /* Update V */
         V.col(vn) = (V.col(v0) + V.col(v1)) * 0.5f;
-        rho[vn] = 0.5f * (rho[v0], rho[v1]);
+        rho[vn] = 0.5f * (rho[v0] + rho[v1]);
         nonmanifold[vn] = false;
         boundary[vn] = is_boundary;
 
@@ -202,6 +222,7 @@ void subdivide(MatrixXi &F, MatrixXd &V, VectorXd& rho, VectorXi &V2E, VectorXi 
         };
         schedule(f3);
     }
+    printf("[SUBDIV-CPU] Done: %d splits, final nV=%d nF=%d\n", nSplit, nV, nF);
     F.conservativeResize(F.rows(), nF);
     V.conservativeResize(V.rows(), nV);
     rho.conservativeResize(nV);

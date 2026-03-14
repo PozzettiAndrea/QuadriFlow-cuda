@@ -58,6 +58,18 @@ class Hierarchy {
     //   1 = "cuda"           — GPU index-priority peeling (matches CPU output)
     int dse_strategy = 1;  // default: cuda when available
 
+    // -flow: max-flow solver strategy
+    //   0 = "boykov"         — Boost Boykov-Kolmogorov (CPU, pointer-based graph, slow build)
+    //   1 = "cuda"           — GPU push-relabel + local refinement (fast but ~1.5x more bad edges)
+    //   2 = "lemon"          — LEMON Preflow (CPU)
+    //   3 = "edkarp"         — GPU Edmonds-Karp (GPU BFS + GPU augment, good quality)
+    //   4 = "dinic"          — GPU Dinic's (GPU fwd+bwd BFS + GPU multi-augment, fastest)
+#ifdef WITH_CUDA
+    int flow_strategy = 4;  // default: GPU Dinic's
+#else
+    int flow_strategy = 0;  // default: boykov when no CUDA
+#endif
+
     void SaveToFile(FILE* fp);
     void LoadFromFile(FILE* fp);
 

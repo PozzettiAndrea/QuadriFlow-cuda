@@ -68,6 +68,8 @@ struct CheckpointHeader {
     char stage[64];         // stage name
     int fixflip_strategy;   // -ff flag value
     int dse_strategy;       // -dse flag value
+    int subdiv_strategy;    // -subdiv flag value
+    int flow_strategy;      // -flow flag value
     int flag_preserve_sharp;
     int flag_preserve_boundary;
     int flag_adaptive_scale;
@@ -76,7 +78,7 @@ struct CheckpointHeader {
     int target_faces;       // -f flag value
     char input_mesh[256];   // input mesh path
     long long timestamp;    // unix timestamp
-    char reserved[192];     // padding for future use
+    char reserved[184];     // padding for future use (was 192, used 8 for new fields)
 };
 
 // Save full Parametrizer state at a given stage

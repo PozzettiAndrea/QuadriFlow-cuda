@@ -36,9 +36,11 @@ static void print_usage() {
     printf("  -mcf                    Minimum cost flow\n");
     printf("  -sat                    Aggressive SAT\n");
     printf("  -seed <n>               RNG seed\n");
+    printf("  -G, --cuda              Enable CUDA for all strategies\n");
     printf("  -ff <strategy>          FixFlip strategy: cpu, gpu-prefilter, gpu-only\n");
     printf("  -subdiv <strategy>      Subdivide strategy: cpu, cuda\n");
     printf("  -dse <strategy>         DownsampleEdgeGraph strategy: cpu, cuda\n");
+    printf("  -flow <strategy>        Max-flow solver: boykov, cuda, lemon, edkarp, dinic\n");
     printf("\n");
     printf("Checkpoint options:\n");
     printf("  -save-dir <dir>         Directory for checkpoint files\n");
@@ -108,6 +110,19 @@ int main(int argc, char** argv) {
             if (strcmp(s, "cpu") == 0)        field.hierarchy.dse_strategy = 0;
             else if (strcmp(s, "cuda") == 0)  field.hierarchy.dse_strategy = 1;
             else { printf("Unknown -dse strategy: %s\n", s); return 1; }
+        } else if (strcmp(argv[i], "-flow") == 0 && i + 1 < argc) {
+            const char* s = argv[++i];
+            if (strcmp(s, "boykov") == 0)     field.hierarchy.flow_strategy = 0;
+            else if (strcmp(s, "cuda") == 0)  field.hierarchy.flow_strategy = 1;
+            else if (strcmp(s, "lemon") == 0) field.hierarchy.flow_strategy = 2;
+            else if (strcmp(s, "edkarp") == 0) field.hierarchy.flow_strategy = 3;
+            else if (strcmp(s, "dinic") == 0) field.hierarchy.flow_strategy = 4;
+            else { printf("Unknown -flow strategy: %s (valid: boykov, cuda, lemon, edkarp, dinic)\n", s); return 1; }
+        } else if (strcmp(argv[i], "-G") == 0 || strcmp(argv[i], "--cuda") == 0) {
+            field.hierarchy.subdiv_strategy = 1;
+            field.hierarchy.dse_strategy = 1;
+            field.hierarchy.flow_strategy = 4;
+            // fixflip stays cpu (GPU doesn't help, see experiments.md §6)
         } else if (strcmp(argv[i], "-save-dir") == 0 && i + 1 < argc) {
             save_dir = argv[++i];
         } else if (strcmp(argv[i], "-save-at") == 0 && i + 1 < argc) {
@@ -174,11 +189,24 @@ int main(int argc, char** argv) {
             printf("ERROR: -run-from requires -save-dir\n");
             return 1;
         }
+        // Save CLI-specified strategies before checkpoint load overwrites them
+        int cli_ff = field.hierarchy.fixflip_strategy;
+        int cli_subdiv = field.hierarchy.subdiv_strategy;
+        int cli_dse = field.hierarchy.dse_strategy;
+        int cli_flow = field.hierarchy.flow_strategy;
+
         PipelineStage loaded = load_checkpoint(field, save_dir.c_str(), run_from);
         if (loaded == STAGE_NONE) {
             printf("ERROR: Failed to load checkpoint for stage '%s'\n", stage_name(run_from));
             return 1;
         }
+
+        // CLI flags override checkpoint-saved strategies
+        field.hierarchy.fixflip_strategy = cli_ff;
+        field.hierarchy.subdiv_strategy = cli_subdiv;
+        field.hierarchy.dse_strategy = cli_dse;
+        field.hierarchy.flow_strategy = cli_flow;
+
         printf("[PIPELINE] Resuming after stage '%s'\n", stage_name(run_from));
     }
 

@@ -1459,18 +1459,26 @@ void Optimizer::optimize_integer_constraints(Hierarchy& mRes, std::map<int, int>
                 printf("[TIMING]     solver=ECMaxFlow level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
                 solver = std::make_unique<ECMaxFlowHelper>();
             } else {
-                const char* flow_env = getenv("QUADRIFLOW_SOLVER");
-                std::string flow_solver = flow_env ? flow_env : "boykov";
-                if (flow_solver == "lemon") {
+                int fs = mRes.flow_strategy;
+                if (fs == 2) {
                     printf("[TIMING]     solver=LemonPreflow level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
                     solver = std::make_unique<LemonPreflowHelper>();
-                } else if (flow_solver == "pushrelabel") {
-                    printf("[TIMING]     solver=PushRelabel level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
-                    solver = std::make_unique<PushRelabelMaxFlowHelper>();
 #ifdef WITH_CUDA
-                } else if (flow_solver == "cuda") {
-                    printf("[TIMING]     solver=CudaMaxFlow level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
-                    solver = std::make_unique<CudaMaxFlowHelper>();
+                } else if (fs == 1) {
+                    printf("[TIMING]     solver=CudaMaxFlow+Refine level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
+                    auto s = std::make_unique<CudaMaxFlowHelper>();
+                    s->set_mode(1);
+                    solver = std::move(s);
+                } else if (fs == 3) {
+                    printf("[TIMING]     solver=GPU-EdmondsKarp level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
+                    auto s = std::make_unique<CudaMaxFlowHelper>();
+                    s->set_mode(3);
+                    solver = std::move(s);
+                } else if (fs == 4) {
+                    printf("[TIMING]     solver=GPU-Dinic level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
+                    auto s = std::make_unique<CudaMaxFlowHelper>();
+                    s->set_mode(4);
+                    solver = std::move(s);
 #endif
                 } else {
                     printf("[TIMING]     solver=BoykovMaxFlow level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
