@@ -12,6 +12,7 @@
 #include <vector>
 #include <queue>
 #include <algorithm>
+#include <chrono>
 #include <cuda_runtime.h>
 
 namespace qflow {
@@ -125,6 +126,36 @@ __global__ void k_dinic_bfs_backward(
     for (int e = nindex[v]; e < nindex[v + 1]; e++) {
         int w = nlist[e];
         if (level[w] < 0 || level[w] != level[v] - 1) continue;
+        if (flow[e] <= 0) continue;
+        if (atomicCAS(&reach[w], 0, 1) == 0)
+            next_frontier[atomicAdd(next_count, 1)] = w;
+    }
+}
+
+// ---- Backward BFS on full residual graph (no level check) ----
+// Used to find all nodes that can reach sink in the residual graph.
+__global__ void k_bfs_backward_residual(
+    const int* nindex, const int* nlist,
+    const int* rnindex, const int* rnlist, const int* retoe,
+    const int* cap, const int* flow,
+    const int* frontier, int frontier_size,
+    int* reach, int* next_frontier, int* next_count
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= frontier_size) return;
+    int v = frontier[tid];
+
+    // Forward residual: edge u->v with cap-flow>0 means u can reach v→sink
+    for (int re = rnindex[v]; re < rnindex[v + 1]; re++) {
+        int u = rnlist[re];
+        int e_fwd = retoe[re];
+        if (cap[e_fwd] - flow[e_fwd] <= 0) continue;
+        if (atomicCAS(&reach[u], 0, 1) == 0)
+            next_frontier[atomicAdd(next_count, 1)] = u;
+    }
+    // Backward residual: edge v->w with flow>0 means w can reach v→sink
+    for (int e = nindex[v]; e < nindex[v + 1]; e++) {
+        int w = nlist[e];
         if (flow[e] <= 0) continue;
         if (atomicCAS(&reach[w], 0, 1) == 0)
             next_frontier[atomicAdd(next_count, 1)] = w;
@@ -451,67 +482,193 @@ CudaMaxFlowResult cuda_dinic_solve(
     // Download flow after Dinic phase
     cudaMemcpy(result.edge_flows.data(), d_flow, num_edges*sizeof(int), cudaMemcpyDeviceToHost);
 
-    // Save intermediate flow state for debugging/testing different cleanup strategies
-    {
-        FILE* fp = fopen("/tmp/qf-dinic-flow.bin", "wb");
-        if (fp) {
-            fwrite(&num_nodes, sizeof(int), 1, fp);
-            fwrite(&num_edges, sizeof(int), 1, fp);
-            fwrite(&source, sizeof(int), 1, fp);
-            fwrite(&sink, sizeof(int), 1, fp);
-            fwrite(&total_flow, sizeof(int), 1, fp);
-            fwrite(result.edge_flows.data(), sizeof(int), num_edges, fp);
-            fwrite(h_nindex, sizeof(int), num_nodes+1, fp);
-            fwrite(h_nlist, sizeof(int), num_edges, fp);
-            fwrite(h_cap, sizeof(int), num_edges, fp);
-            fwrite(h_rnindex, sizeof(int), num_nodes+1, fp);
-            fwrite(h_rnlist, sizeof(int), num_edges, fp);
-            fwrite(h_retoe, sizeof(int), num_edges, fp);
-            fclose(fp);
-            printf("[TIMING]       Saved Dinic flow state to /tmp/qf-dinic-flow.bin\n");
-        }
-    }
+    // (debug save removed — use -save-all for checkpoints instead)
 
-    // ==== PHASE 2: GPU EK for remaining flow ====
-    // Reuse GPU arrays. Flow already on device from Dinic phase.
-    // Re-upload since we downloaded for the debug save.
-    cudaMemcpy(d_flow, result.edge_flows.data(), num_edges*sizeof(int), cudaMemcpyHostToDevice);
+    // ==== PHASE 2: Compact subgraph EK ====
+    // Two BFS identify the active subgraph (reachable from source AND reaching sink).
+    // Build compact CSR, run CPU EK on it. Much faster than full-graph EK.
     {
-        int ek_augs = 0;
+        auto t_cleanup_start = std::chrono::high_resolution_clock::now();
+
+        // Step 1: Forward BFS from source on residual (reuse level array)
+        // level[v] >= 0 means reachable from source (already set by last Dinic BFS)
+        // But Dinic may have modified flow since last BFS. Re-do a full forward BFS.
+        cudaMemset(d_level, 0xFF, num_nodes * sizeof(int));
+        int zero = 0;
+        cudaMemcpy(d_level + source, &zero, sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_frontier, &src_val, sizeof(int), cudaMemcpyHostToDevice);
+        int fsize = 1, cur_lev = 0;
+        while (fsize > 0) {
+            cudaMemset(d_next_count, 0, sizeof(int));
+            k_dinic_bfs_expand<<<(fsize+B-1)/B, B>>>(
+                d_nindex, d_nlist, d_cap, d_flow,
+                d_rnindex, d_rnlist, d_retoe,
+                d_frontier, fsize, cur_lev,
+                d_level, d_next_frontier, d_next_count);
+            cudaMemcpy(&fsize, d_next_count, sizeof(int), cudaMemcpyDeviceToHost);
+            std::swap(d_frontier, d_next_frontier);
+            cur_lev++;
+        }
+
+        // Step 2: Backward BFS from sink on full residual (no level check)
+        cudaMemset(d_reach, 0, num_nodes * sizeof(int));
+        int one = 1;
+        cudaMemcpy(d_reach + sink, &one, sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_frontier, &sink_val, sizeof(int), cudaMemcpyHostToDevice);
+        fsize = 1;
+        while (fsize > 0) {
+            cudaMemset(d_next_count, 0, sizeof(int));
+            k_bfs_backward_residual<<<(fsize+B-1)/B, B>>>(
+                d_nindex, d_nlist, d_rnindex, d_rnlist, d_retoe,
+                d_cap, d_flow,
+                d_frontier, fsize,
+                d_reach, d_next_frontier, d_next_count);
+            cudaMemcpy(&fsize, d_next_count, sizeof(int), cudaMemcpyDeviceToHost);
+            std::swap(d_frontier, d_next_frontier);
+        }
+
+        // Download level and reach arrays
+        std::vector<int> h_level(num_nodes), h_reach(num_nodes);
+        cudaMemcpy(h_level.data(), d_level, num_nodes * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_reach.data(), d_reach, num_nodes * sizeof(int), cudaMemcpyDeviceToHost);
+
+        // Also need flow on host for compact EK
+        // (already downloaded into result.edge_flows above)
+
+        // Step 3: Build compact subgraph
+        // Active nodes: level[v] >= 0 AND reach[v] == 1
+        std::vector<int> node_map(num_nodes, -1);  // original → compact
+        int K = 0;
+        for (int v = 0; v < num_nodes; v++) {
+            if (h_level[v] >= 0 && h_reach[v]) {
+                node_map[v] = K++;
+            }
+        }
+        // Always include source and sink
+        if (node_map[source] == -1) node_map[source] = K++;
+        if (node_map[sink] == -1) node_map[sink] = K++;
+
+        int compact_src = node_map[source];
+        int compact_sink = node_map[sink];
+
+        // Build compact CSR + reverse CSR
+        // First pass: count edges per compact node
+        std::vector<int> c_nindex(K + 1, 0);
+        int* h_flow = result.edge_flows.data();
+        for (int u = 0; u < num_nodes; u++) {
+            if (node_map[u] == -1) continue;
+            int cu = node_map[u];
+            for (int e = h_nindex[u]; e < h_nindex[u + 1]; e++) {
+                int v = h_nlist[e];
+                if (node_map[v] == -1) continue;
+                if (h_cap[e] - h_flow[e] <= 0) continue;
+                c_nindex[cu + 1]++;
+            }
+            // Backward residual edges: for each edge w->u with flow>0
+            for (int re = h_rnindex[u]; re < h_rnindex[u + 1]; re++) {
+                int w = h_rnlist[re];
+                if (node_map[w] == -1) continue;
+                int ef = h_retoe[re];
+                if (h_flow[ef] <= 0) continue;
+                c_nindex[cu + 1]++;
+            }
+        }
+        for (int i = 1; i <= K; i++) c_nindex[i] += c_nindex[i - 1];
+        int c_num_edges = c_nindex[K];
+
+        std::vector<int> c_nlist(c_num_edges), c_cap(c_num_edges);
+        std::vector<int> c_orig_edge(c_num_edges);  // map compact edge → original edge
+        std::vector<int> c_dir(c_num_edges);         // +1 forward, -1 backward
+        std::vector<int> c_offset(K, 0);
+
+        for (int u = 0; u < num_nodes; u++) {
+            if (node_map[u] == -1) continue;
+            int cu = node_map[u];
+            // Forward edges
+            for (int e = h_nindex[u]; e < h_nindex[u + 1]; e++) {
+                int v = h_nlist[e];
+                if (node_map[v] == -1) continue;
+                int res = h_cap[e] - h_flow[e];
+                if (res <= 0) continue;
+                int pos = c_nindex[cu] + c_offset[cu]++;
+                c_nlist[pos] = node_map[v];
+                c_cap[pos] = res;
+                c_orig_edge[pos] = e;
+                c_dir[pos] = 1;
+            }
+            // Backward residual edges
+            for (int re = h_rnindex[u]; re < h_rnindex[u + 1]; re++) {
+                int w = h_rnlist[re];
+                if (node_map[w] == -1) continue;
+                int ef = h_retoe[re];
+                if (h_flow[ef] <= 0) continue;
+                int pos = c_nindex[cu] + c_offset[cu]++;
+                c_nlist[pos] = node_map[w];
+                c_cap[pos] = h_flow[ef];
+                c_orig_edge[pos] = ef;
+                c_dir[pos] = -1;
+            }
+        }
+
+        printf("[TIMING]       Compact subgraph: %d nodes, %d edges (from %d/%d)\n",
+               K, c_num_edges, num_nodes, num_edges);
+
+        // Step 4: CPU Edmonds-Karp on compact graph
+        std::vector<int> c_flow(c_num_edges, 0);
+        std::vector<int> c_par(K), c_par_e(K), c_par_d(K);
+        std::vector<int> c_bfs_q;
+        c_bfs_q.reserve(K);
+        int ek_augs = 0, ek_flow = 0;
+
         while (true) {
-            cudaMemset(d_parent, 0xFF, num_nodes*sizeof(int));
-            cudaMemcpy(d_parent+source, &src_val, sizeof(int), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_frontier, &src_val, sizeof(int), cudaMemcpyHostToDevice);
-            int fsize = 1;
+            std::fill(c_par.begin(), c_par.end(), -1);
+            c_par[compact_src] = compact_src;
+            c_bfs_q.clear();
+            c_bfs_q.push_back(compact_src);
+
             bool found = false;
-            while (fsize > 0) {
-                cudaMemset(d_next_count, 0, sizeof(int));
-                k_ek_bfs_expand<<<(fsize+B-1)/B, B>>>(
-                    d_nindex, d_nlist, d_cap, d_flow,
-                    d_rnindex, d_rnlist, d_retoe,
-                    d_frontier, fsize,
-                    d_parent, d_parent_edge, d_parent_dir,
-                    d_next_frontier, d_next_count);
-                int sp;
-                cudaMemcpy(&sp, d_parent+sink, sizeof(int), cudaMemcpyDeviceToHost);
-                if (sp != -1) { found = true; break; }
-                cudaMemcpy(&fsize, d_next_count, sizeof(int), cudaMemcpyDeviceToHost);
-                std::swap(d_frontier, d_next_frontier);
+            for (int qi = 0; qi < (int)c_bfs_q.size() && !found; qi++) {
+                int u = c_bfs_q[qi];
+                for (int e = c_nindex[u]; e < c_nindex[u + 1]; e++) {
+                    int v = c_nlist[e];
+                    if (c_par[v] != -1) continue;
+                    if (c_cap[e] - c_flow[e] <= 0) continue;
+                    c_par[v] = u; c_par_e[v] = e; c_par_d[v] = 1;
+                    c_bfs_q.push_back(v);
+                    if (v == compact_sink) { found = true; break; }
+                }
             }
             if (!found) break;
-            k_ek_trace_push<<<1,1>>>(d_parent, d_parent_edge, d_parent_dir,
-                                      d_cap, d_flow, source, sink, d_bottleneck);
-            int bn;
-            cudaMemcpy(&bn, d_bottleneck, sizeof(int), cudaMemcpyDeviceToHost);
-            total_flow += bn;
-            ek_augs++;
-        }
-        if (ek_augs > 0)
-            printf("[TIMING]       GPU EK cleanup: %d augmentations, total flow=%d\n", ek_augs, total_flow);
-    }
 
-    // Download final flow
-    cudaMemcpy(result.edge_flows.data(), d_flow, num_edges*sizeof(int), cudaMemcpyDeviceToHost);
+            int bn = INT_MAX;
+            for (int v = compact_sink; v != compact_src; v = c_par[v]) {
+                int r = c_cap[c_par_e[v]] - c_flow[c_par_e[v]];
+                if (r < bn) bn = r;
+            }
+            for (int v = compact_sink; v != compact_src; v = c_par[v]) {
+                c_flow[c_par_e[v]] += bn;
+            }
+            ek_augs++;
+            ek_flow += bn;
+        }
+
+        // Step 5: Map compact flow back to original edges
+        for (int e = 0; e < c_num_edges; e++) {
+            if (c_flow[e] <= 0) continue;
+            int orig_e = c_orig_edge[e];
+            int dir = c_dir[e];
+            if (dir == 1)
+                result.edge_flows[orig_e] += c_flow[e];
+            else
+                result.edge_flows[orig_e] -= c_flow[e];
+        }
+        total_flow += ek_flow;
+
+        auto t_cleanup_end = std::chrono::high_resolution_clock::now();
+        double cleanup_s = std::chrono::duration<double>(t_cleanup_end - t_cleanup_start).count();
+        printf("[TIMING]       Compact EK cleanup: %d augmentations, flow=%d, total flow=%d (%.3f s)\n",
+               ek_augs, ek_flow, total_flow, cleanup_s);
+    }
 
     cudaFree(d_nindex); cudaFree(d_nlist); cudaFree(d_cap); cudaFree(d_flow);
     cudaFree(d_rnindex); cudaFree(d_rnlist); cudaFree(d_retoe);
