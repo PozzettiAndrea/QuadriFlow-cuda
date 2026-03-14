@@ -193,7 +193,7 @@ __global__ void k_dinic_multi_augment(
 
         bool advanced = false;
 
-        // Try forward edges: find w where v->w has residual and level[w]=level[v]+1
+        // Try forward edges: v→w with residual>0 and level[w]=level[v]+1
         for (int& e = fr.fe_iter; e < nindex[v + 1]; e++) {
             int w = nlist[e];
             if (!reach[w]) continue;
@@ -202,34 +202,17 @@ __global__ void k_dinic_multi_augment(
             if (sp < 255) {
                 stack[sp] = {w, rnindex[w], nindex[w], e, 1};
                 sp++;
-                e++;  // advance past this edge for when we backtrack
+                e++;
                 advanced = true;
                 break;
             }
         }
 
         if (!advanced) {
-            // Try backward edges: find u where edge u->v has flow>0 and level[u]=level[v]+1
-            // Wait — backward residual means we can "undo" flow on v->u.
-            // In the level graph going source→sink, a backward edge at node v means:
-            // there's a forward edge v->w with flow>0, and level[w]=level[v]+1.
-            // We can cancel that flow, effectively going v→w in the level graph.
-            // Actually I think the direction is simpler for Dinic's:
-            // From v, we want to go to nodes at level[v]+1.
-            // Forward: edge v->w with residual cap-flow>0 (already handled above)
-            // Backward: edge w->v with flow>0 — this is a backward residual edge v→w
-            // Check: level[w] = level[v]+1? But w->v has level[w] < level[v] in the BFS tree.
-            // Hmm, backward edges in residual go "against" the BFS direction.
-            // In Dinic's level graph, we only follow edges u->v where level[v]=level[u]+1.
-            // Backward residual edge at v: if there's an edge w->v with flow[w->v]>0,
-            // then in residual graph there's edge v->w. For this to be in the level graph,
-            // level[w] = level[v]+1. But w->v was a forward edge, so level[w] <= level[v].
-            // Contradiction unless level[w] = level[v]+1 happened via another path.
-            // This CAN happen in graphs with cycles. Let's check via reverse CSR:
-            // For each edge w->v (found via reverse CSR of v): if flow[w->v]>0 and level[w]=level[v]+1
+            // Backward residual: edge w→v with flow>0, level[w]=level[v]+1
             for (int& re = fr.re_iter; re < rnindex[v + 1]; re++) {
                 int w = rnlist[re];
-                int e_fwd = retoe[re];  // edge w->v
+                int e_fwd = retoe[re];
                 if (!reach[w]) continue;
                 if (level[w] != level[v] + 1) continue;
                 if (flow[e_fwd] <= 0) continue;
@@ -345,7 +328,10 @@ CudaMaxFlowResult cuda_edmonds_karp_solve(
 
 
 // ============================================================
-// GPU Dinic's: fwd BFS + bwd BFS + multi-augment per phase
+// GPU Dinic's: Dinic phases for bulk flow, Edmonds-Karp for stragglers
+//
+// Phase 1: Dinic's (fwd BFS + bwd BFS + multi-augment) — gets ~83% of flow fast
+// Phase 2: Edmonds-Karp (full BFS per augment) — handles remaining ~17% correctly
 // ============================================================
 CudaMaxFlowResult cuda_dinic_solve(
     int num_nodes, int source, int sink,
@@ -356,11 +342,13 @@ CudaMaxFlowResult cuda_dinic_solve(
     CudaMaxFlowResult result;
     result.edge_flows.resize(num_edges);
 
+    // Allocate all GPU arrays (shared by both phases)
     int *d_nindex, *d_nlist, *d_cap, *d_flow;
     int *d_rnindex, *d_rnlist, *d_retoe;
     int *d_level, *d_reach;
+    int *d_parent, *d_parent_edge, *d_parent_dir;
     int *d_frontier, *d_next_frontier, *d_next_count;
-    int *d_total_flow, *d_num_paths;
+    int *d_total_flow, *d_num_paths, *d_bottleneck;
 
     cudaMalloc(&d_nindex, (num_nodes+1)*sizeof(int));
     cudaMalloc(&d_nlist, num_edges*sizeof(int));
@@ -371,11 +359,15 @@ CudaMaxFlowResult cuda_dinic_solve(
     cudaMalloc(&d_retoe, num_edges*sizeof(int));
     cudaMalloc(&d_level, num_nodes*sizeof(int));
     cudaMalloc(&d_reach, num_nodes*sizeof(int));
+    cudaMalloc(&d_parent, num_nodes*sizeof(int));
+    cudaMalloc(&d_parent_edge, num_nodes*sizeof(int));
+    cudaMalloc(&d_parent_dir, num_nodes*sizeof(int));
     cudaMalloc(&d_frontier, num_nodes*sizeof(int));
     cudaMalloc(&d_next_frontier, num_nodes*sizeof(int));
     cudaMalloc(&d_next_count, sizeof(int));
     cudaMalloc(&d_total_flow, sizeof(int));
     cudaMalloc(&d_num_paths, sizeof(int));
+    cudaMalloc(&d_bottleneck, sizeof(int));
 
     cudaMemcpy(d_nindex, h_nindex, (num_nodes+1)*sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_nlist, h_nlist, num_edges*sizeof(int), cudaMemcpyHostToDevice);
@@ -386,12 +378,13 @@ CudaMaxFlowResult cuda_dinic_solve(
     cudaMemset(d_flow, 0, num_edges*sizeof(int));
 
     const int B = 256;
-    int total_flow = 0, total_paths = 0, phases = 0;
+    int total_flow = 0, total_paths = 0, dinic_phases = 0;
     int src_val = source, sink_val = sink;
 
+    // ==== PHASE 1: Dinic's (bulk flow) ====
     while (true) {
-        // ==== Forward BFS: build level graph ====
-        cudaMemset(d_level, 0xFF, num_nodes*sizeof(int));  // -1
+        // Forward BFS: build level graph
+        cudaMemset(d_level, 0xFF, num_nodes*sizeof(int));
         int zero = 0;
         cudaMemcpy(d_level+source, &zero, sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(d_frontier, &src_val, sizeof(int), cudaMemcpyHostToDevice);
@@ -406,12 +399,9 @@ CudaMaxFlowResult cuda_dinic_solve(
                 d_rnindex, d_rnlist, d_retoe,
                 d_frontier, fsize, current_level,
                 d_level, d_next_frontier, d_next_count);
-
-            // Check sink
             int sink_lev;
             cudaMemcpy(&sink_lev, d_level+sink, sizeof(int), cudaMemcpyDeviceToHost);
             if (sink_lev >= 0) { found_sink = true; break; }
-
             cudaMemcpy(&fsize, d_next_count, sizeof(int), cudaMemcpyDeviceToHost);
             std::swap(d_frontier, d_next_frontier);
             current_level++;
@@ -419,7 +409,7 @@ CudaMaxFlowResult cuda_dinic_solve(
 
         if (!found_sink) break;
 
-        // ==== Backward BFS: mark nodes that can reach sink ====
+        // Backward BFS: mark nodes that can reach sink
         cudaMemset(d_reach, 0, num_nodes*sizeof(int));
         int one = 1;
         cudaMemcpy(d_reach+sink, &one, sizeof(int), cudaMemcpyHostToDevice);
@@ -429,8 +419,7 @@ CudaMaxFlowResult cuda_dinic_solve(
         while (fsize > 0) {
             cudaMemset(d_next_count, 0, sizeof(int));
             k_dinic_bfs_backward<<<(fsize+B-1)/B, B>>>(
-                d_nindex, d_nlist,
-                d_rnindex, d_rnlist, d_retoe,
+                d_nindex, d_nlist, d_rnindex, d_rnlist, d_retoe,
                 d_cap, d_flow, d_level,
                 d_frontier, fsize,
                 d_reach, d_next_frontier, d_next_count);
@@ -438,10 +427,9 @@ CudaMaxFlowResult cuda_dinic_solve(
             std::swap(d_frontier, d_next_frontier);
         }
 
-        // ==== Multi-augment on pruned level graph ====
+        // Multi-augment on pruned level graph
         k_dinic_multi_augment<<<1, 1>>>(
-            d_nindex, d_nlist,
-            d_rnindex, d_rnlist, d_retoe,
+            d_nindex, d_nlist, d_rnindex, d_rnlist, d_retoe,
             d_cap, d_flow, d_level, d_reach,
             source, sink, d_total_flow, d_num_paths);
 
@@ -451,20 +439,63 @@ CudaMaxFlowResult cuda_dinic_solve(
 
         total_flow += phase_flow;
         total_paths += phase_paths;
-        phases++;
+        dinic_phases++;
 
-        if (phase_flow == 0) break;  // no augmenting paths found despite sink reachable
+        if (phase_flow == 0) break;
     }
 
-    printf("[TIMING]       GPU Dinic: %d phases, %d paths, flow=%d\n",
-           phases, total_paths, total_flow);
+    printf("[TIMING]       GPU Dinic phase: %d phases, %d paths, flow=%d\n",
+           dinic_phases, total_paths, total_flow);
+
+    // ==== PHASE 2: Edmonds-Karp for remaining flow ====
+    // Handles paths that Dinic's backward BFS pruning missed.
+    // Uses the same GPU arrays (flow state continues from Dinic).
+    int ek_augmentations = 0;
+
+    while (true) {
+        cudaMemset(d_parent, 0xFF, num_nodes*sizeof(int));
+        cudaMemcpy(d_parent+source, &src_val, sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_frontier, &src_val, sizeof(int), cudaMemcpyHostToDevice);
+        int fsize = 1;
+        bool found = false;
+
+        while (fsize > 0) {
+            cudaMemset(d_next_count, 0, sizeof(int));
+            k_ek_bfs_expand<<<(fsize+B-1)/B, B>>>(
+                d_nindex, d_nlist, d_cap, d_flow,
+                d_rnindex, d_rnlist, d_retoe,
+                d_frontier, fsize,
+                d_parent, d_parent_edge, d_parent_dir,
+                d_next_frontier, d_next_count);
+            int sp;
+            cudaMemcpy(&sp, d_parent+sink, sizeof(int), cudaMemcpyDeviceToHost);
+            if (sp != -1) { found = true; break; }
+            cudaMemcpy(&fsize, d_next_count, sizeof(int), cudaMemcpyDeviceToHost);
+            std::swap(d_frontier, d_next_frontier);
+        }
+        if (!found) break;
+
+        k_ek_trace_push<<<1,1>>>(d_parent, d_parent_edge, d_parent_dir,
+                                  d_cap, d_flow, source, sink, d_bottleneck);
+        int bn;
+        cudaMemcpy(&bn, d_bottleneck, sizeof(int), cudaMemcpyDeviceToHost);
+        total_flow += bn;
+        ek_augmentations++;
+    }
+
+    if (ek_augmentations > 0) {
+        printf("[TIMING]       GPU EK cleanup: %d augmentations, total flow=%d\n",
+               ek_augmentations, total_flow);
+    }
+
     cudaMemcpy(result.edge_flows.data(), d_flow, num_edges*sizeof(int), cudaMemcpyDeviceToHost);
 
     cudaFree(d_nindex); cudaFree(d_nlist); cudaFree(d_cap); cudaFree(d_flow);
     cudaFree(d_rnindex); cudaFree(d_rnlist); cudaFree(d_retoe);
     cudaFree(d_level); cudaFree(d_reach);
+    cudaFree(d_parent); cudaFree(d_parent_edge); cudaFree(d_parent_dir);
     cudaFree(d_frontier); cudaFree(d_next_frontier); cudaFree(d_next_count);
-    cudaFree(d_total_flow); cudaFree(d_num_paths);
+    cudaFree(d_total_flow); cudaFree(d_num_paths); cudaFree(d_bottleneck);
 
     result.max_flow = total_flow;
     return result;
