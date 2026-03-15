@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cmath>
+#include <chrono>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -995,6 +996,7 @@ extern "C" void cuda_downsample_graph(
     int blockSize = 256;
     int gridVerts = (nVerts + blockSize - 1) / blockSize;
 
+    auto _t0 = std::chrono::high_resolution_clock::now();
     // Step 1: Score entries on GPU
     int *d_entry_i, *d_entry_j;
     double *d_entry_order;
@@ -1029,6 +1031,7 @@ extern "C" void cuda_downsample_graph(
         thrust::copy(d_entries.begin(), d_entries.end(), entries.data());
     }
 
+    auto _t1 = std::chrono::high_resolution_clock::now();
     // Step 3: Greedy merge (CPU, sequential)
     std::vector<bool> mergeFlag(nVerts, false);
     int nCollapsed = 0;
@@ -1045,6 +1048,7 @@ extern "C" void cuda_downsample_graph(
     }
     int vertexCount_p = nVerts - nCollapsed;
     *vertexCount_p_out = vertexCount_p;
+    auto _t2 = std::chrono::high_resolution_clock::now();
 
     // Step 4: Build collapsed vertices + unmerged vertices on GPU
     int *d_collapsed_i, *d_collapsed_j;
@@ -1162,6 +1166,13 @@ extern "C" void cuda_downsample_graph(
         write_pos += cnt;
         (*h_adjRowPtr_p_out)[i + 1] = write_pos;
     }
+
+    auto _t3 = std::chrono::high_resolution_clock::now();
+    printf("[DSE-TIMING] score+sort=%.0f merge=%.0f build+adj=%.0f ms (nV=%d nCollapsed=%d)\n",
+           std::chrono::duration<double, std::milli>(_t1 - _t0).count(),
+           std::chrono::duration<double, std::milli>(_t2 - _t1).count(),
+           std::chrono::duration<double, std::milli>(_t3 - _t2).count(),
+           nVerts, nCollapsed);
 
     // Cleanup
     cudaFree(d_adjRowPtr); cudaFree(d_adjColInd); cudaFree(d_adjWeights);
