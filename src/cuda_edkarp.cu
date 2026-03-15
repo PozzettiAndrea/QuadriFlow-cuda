@@ -50,14 +50,50 @@ __global__ void k_ek_bfs_expand(
     }
 }
 
-// ---- Visited-bitmap BFS (smaller memset: 512KB vs 16MB) ----
-// Uses a separate visited[] array (int per node, could be byte).
-// memset(visited, 0, N*4) = 16MB — same as parent. Not helpful.
-// Actually we need a different approach entirely.
+// ---- Bottom-up BFS: each UNVISITED node checks if any neighbor is visited ----
+// Much faster than top-down when frontier is large (>V/20) because:
+// 1. Most nodes are already visited → exit immediately (cheap)
+// 2. Unvisited nodes scan their OWN adjacency (sequential CSR access, good coalescing)
+// 3. No random parent[] writes from frontier expansion
+// Reference: Merrill et al. "Scalable GPU Graph Traversal" (NVIDIA 2011)
+__global__ void k_ek_bfs_bottom_up(
+    const int* nindex, const int* nlist, const int* cap, const int* flow,
+    const int* rnindex, const int* rnlist, const int* retoe,
+    int* parent, int* parent_edge, int* parent_dir,
+    int num_nodes, int source, int sink,
+    int* next_count
+) {
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= num_nodes) return;
+    if (parent[v] != -1) return;  // already visited, skip
 
-// ---- Standalone GPU EK solver (optimized for full solve) ----
-// Used as flow strategy 3. Same as cuda_edmonds_karp_solve but
-// available from this compilation unit.
+    // Check reverse edges: u→v with residual (u is visited, v is not)
+    for (int re = rnindex[v]; re < rnindex[v + 1]; re++) {
+        int u = rnlist[re];
+        if (parent[u] == -1) continue;  // u not visited yet
+        int ef = retoe[re];
+        if (cap[ef] - flow[ef] <= 0) continue;
+        // Found a visited neighbor with residual — adopt v
+        parent[v] = u;
+        parent_edge[v] = ef;
+        parent_dir[v] = 1;
+        atomicAdd(next_count, 1);
+        return;
+    }
+
+    // Check forward edges: v→w with flow>0 (backward residual w→v)
+    // If w is visited and flow[v→w]>0, then v can reach w via cancellation
+    for (int e = nindex[v]; e < nindex[v + 1]; e++) {
+        int w = nlist[e];
+        if (parent[w] == -1) continue;  // w not visited
+        if (flow[e] <= 0) continue;
+        parent[v] = w;
+        parent_edge[v] = e;
+        parent_dir[v] = -1;
+        atomicAdd(next_count, 1);
+        return;
+    }
+}
 
 // ---- Path trace + flow push (single thread, Edmonds-Karp) ----
 __global__ void k_ek_trace_push(

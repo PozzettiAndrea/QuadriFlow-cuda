@@ -86,24 +86,38 @@ inline std::pair<int, int> compat_orientation_extrinsic_index_4(const Vector3d &
                                                                 const Vector3d &n0,
                                                                 const Vector3d &q1,
                                                                 const Vector3d &n1) {
-    const Vector3d A[2] = {q0, n0.cross(q0)};
-    const Vector3d B[2] = {q1, n1.cross(q1)};
+    // Raw math version — avoids Eigen temporaries for hot-path performance
+    // A[0] = q0, A[1] = n0 × q0
+    // B[0] = q1, B[1] = n1 × q1
+    double A0x = q0[0], A0y = q0[1], A0z = q0[2];
+    double A1x = n0[1]*q0[2] - n0[2]*q0[1];
+    double A1y = n0[2]*q0[0] - n0[0]*q0[2];
+    double A1z = n0[0]*q0[1] - n0[1]*q0[0];
+    double B0x = q1[0], B0y = q1[1], B0z = q1[2];
+    double B1x = n1[1]*q1[2] - n1[2]*q1[1];
+    double B1y = n1[2]*q1[0] - n1[0]*q1[2];
+    double B1z = n1[0]*q1[1] - n1[1]*q1[0];
 
-    double best_score = -std::numeric_limits<double>::infinity();
+    // 4 dot products: A[i] · B[j]
+    double d00 = A0x*B0x + A0y*B0y + A0z*B0z;
+    double d01 = A0x*B1x + A0y*B1y + A0z*B1z;
+    double d10 = A1x*B0x + A1y*B0y + A1z*B0z;
+    double d11 = A1x*B1x + A1y*B1y + A1z*B1z;
+
+    double s00 = d00 < 0 ? -d00 : d00;
+    double s01 = d01 < 0 ? -d01 : d01;
+    double s10 = d10 < 0 ? -d10 : d10;
+    double s11 = d11 < 0 ? -d11 : d11;
+
     int best_a = 0, best_b = 0;
+    double best_score = s00;
+    if (s01 > best_score) { best_a = 0; best_b = 1; best_score = s01; }
+    if (s10 > best_score) { best_a = 1; best_b = 0; best_score = s10; }
+    if (s11 > best_score) { best_a = 1; best_b = 1; }
 
-    for (int i = 0; i < 2; ++i) {
-        for (int j = 0; j < 2; ++j) {
-            double score = std::abs(A[i].dot(B[j]));
-            if (score > best_score) {
-                best_a = i;
-                best_b = j;
-                best_score = score;
-            }
-        }
-    }
-
-    if (A[best_a].dot(B[best_b]) < 0) best_b += 2;
+    // Check sign of the winning dot product
+    double dots[4] = {d00, d01, d10, d11};
+    if (dots[best_a * 2 + best_b] < 0) best_b += 2;
 
     return std::make_pair(best_a, best_b);
 }
