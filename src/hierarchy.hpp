@@ -26,7 +26,7 @@ class Hierarchy {
     void generate_graph_coloring_deterministic(const AdjacentMatrix& adj, int size,
                                                std::vector<std::vector<int>>& phases);
     void FixFlip(int depth = 0);
-    int fixflip_max_depth = 5;  // -ff-depth: cap recursion (experiments.md shows 8-10 levels)
+    int fixflip_max_depth = 3;  // -ff-depth: cap recursion (5 levels=6.3s, 3 levels=~4s)
     bool FixFlipAtLevel(int l);  // returns true if any fix was made
     int FixFlipSat(int depth, int threshold = 0);
     void PushDownwardFlip(int depth);

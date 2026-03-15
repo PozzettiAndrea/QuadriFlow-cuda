@@ -499,7 +499,9 @@ int main(int argc, char** argv) {
         // ---- pre-dynamic setup + optimize_positions_dynamic ----
         if (should_run(STAGE_POST_DYNAMIC)) {
             // Build edge-to-quad mapping and diffs
+            unsigned long long _pd0 = GetCurrentTime64();
             std::unordered_map<std::pair<int, int>, int, PairHash> o2e;
+            o2e.reserve(field.F_compact.size() * 4);
             for (int i = 0; i < (int)field.F_compact.size(); ++i) {
                 for (int j = 0; j < 4; ++j) {
                     int v1 = field.F_compact[i][j];
@@ -507,12 +509,14 @@ int main(int argc, char** argv) {
                     o2e[std::make_pair(v1, v2)] = i * 4 + j;
                 }
             }
+            unsigned long long _pd1 = GetCurrentTime64();
             std::vector<std::vector<int>> v2o(V.cols());
             for (int i = 0; i < (int)field.Vset.size(); ++i) {
                 for (auto v : field.Vset[i]) {
                     v2o[v].push_back(i);
                 }
             }
+            unsigned long long _pd2 = GetCurrentTime64();
             std::vector<Vector3d> diffs(field.F_compact.size() * 4, Vector3d(0, 0, 0));
             std::vector<int> diff_count(field.F_compact.size() * 4, 0);
             for (int i = 0; i < F.cols(); ++i) {
@@ -580,6 +584,7 @@ int main(int argc, char** argv) {
                 }
             }
 
+            unsigned long long _pd3 = GetCurrentTime64();
             for (int i = 0; i < (int)diff_count.size(); ++i) {
                 if (diff_count[i] != 0) {
                     diffs[i] /= diff_count[i];
@@ -614,6 +619,9 @@ int main(int argc, char** argv) {
                 }
             }
 
+            unsigned long long _pd4 = GetCurrentTime64();
+            printf("[TIMING] pre-dynamic: o2e=%.3f v2o=%.3f diffs=%.3f sharp=%.3f s\n",
+                   (_pd1-_pd0)*1e-3, (_pd2-_pd1)*1e-3, (_pd3-_pd2)*1e-3, (_pd4-_pd3)*1e-3);
             printf("[TIMING] pre-dynamic setup: %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
             t_stage = GetCurrentTime64();
 
