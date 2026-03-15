@@ -57,7 +57,7 @@ class Hierarchy {
     // -dse: DownsampleEdgeGraph strategy
     //   0 = "cpu"            — Original CPU sequential greedy
     //   1 = "cuda"           — GPU index-priority peeling (matches CPU output)
-    int dse_strategy = 1;  // default: cuda when available
+    int dse_strategy = 0;  // default: CPU (GPU DSE hangs on multi-level builds)
 
     // -flow: max-flow solver strategy
     //   0 = "boykov"         — Boost Boykov-Kolmogorov (CPU, pointer-based graph, slow build)
