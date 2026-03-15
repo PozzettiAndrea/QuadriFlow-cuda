@@ -447,11 +447,21 @@ int main(int argc, char** argv) {
 
         // ---- subdivide_edgeDiff (2nd) + FixFlipSat ----
         if (should_run(STAGE_POST_SUBDIV2)) {
-            subdivide_edgeDiff(F, V, N, Q, O, &field.hierarchy.mS[0], field.V2E, field.hierarchy.mE2E,
-                               field.boundary, field.nonManifold,
-                               field.edge_diff, field.edge_values, field.face_edgeOrients,
-                               field.face_edgeIds, field.sharp_edges, field.singularities, 1);
-            printf("[TIMING] subdivide_edgeDiff (2nd): %lf s\n", (GetCurrentTime64() - t_stage) * 1e-3);
+            // Check if any edges need splitting (|diff| > 1)
+            int bad_count_2 = 0;
+            for (int i = 0; i < (int)field.edge_diff.size(); ++i) {
+                if (abs(field.edge_diff[i][0]) > 1 || abs(field.edge_diff[i][1]) > 1) bad_count_2++;
+            }
+            if (bad_count_2 > 0) {
+                subdivide_edgeDiff(F, V, N, Q, O, &field.hierarchy.mS[0], field.V2E, field.hierarchy.mE2E,
+                                   field.boundary, field.nonManifold,
+                                   field.edge_diff, field.edge_values, field.face_edgeOrients,
+                                   field.face_edgeIds, field.sharp_edges, field.singularities, 1);
+                printf("[TIMING] subdivide_edgeDiff (2nd): %lf s (%d bad edges)\n",
+                       (GetCurrentTime64() - t_stage) * 1e-3, bad_count_2);
+            } else {
+                printf("[TIMING] subdivide_edgeDiff (2nd): SKIPPED (0 bad edges)\n");
+            }
             t_stage = GetCurrentTime64();
 
             field.FixFlipSat();
